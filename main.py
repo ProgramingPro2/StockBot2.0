@@ -172,8 +172,16 @@ class StockTradingEnvironment:
         """Reset the environment for new episode"""
         self.balance = self.initial_balance
         self.shares = {symbol: 0 for symbol in self.symbols}
-        self.current_step = self.lookback_window
         self.data = self._download_data()
+        
+        # Ensure we have enough data for lookback window
+        min_data_length = min([len(self.data[symbol]) for symbol in self.symbols])
+        
+        # Set current step to lookback_window or to data length if not enough data
+        self.current_step = min(self.lookback_window, min_data_length - 1)
+        if self.current_step < self.lookback_window:
+            print(f"Warning: Not enough data for full lookback window. Using {self.current_step} days instead.")
+        
         self.done = False
         self.portfolio_value_history = [self.initial_balance]
         
@@ -182,14 +190,33 @@ class StockTradingEnvironment:
     def _download_data(self):
         """Download historical stock data for all symbols"""
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=365)  # Get 1 year of data
+        # Get more data to ensure we have enough for lookback
+        start_date = end_date - timedelta(days=365 + self.lookback_window * 2)  
         
         data = {}
         for symbol in self.symbols:
-            # Use yfinance to get historical data
-            stock_data = yf.download(symbol, start=start_date, end=end_date)
-            data[symbol] = stock_data
-        
+            try:
+                # Use yfinance to get historical data
+                stock_data = yf.download(symbol, start=start_date, end=end_date)
+                if len(stock_data) == 0:
+                    print(f"Warning: No data available for {symbol}")
+                    # Create dummy data as fallback
+                    dummy_index = pd.date_range(start=start_date, end=end_date, freq='B')
+                    stock_data = pd.DataFrame(index=dummy_index, 
+                                            columns=['Open', 'High', 'Low', 'Close', 'Volume'])
+                    stock_data['Close'] = 100.0  # Default price
+                    stock_data.fillna(method='ffill', inplace=True)
+                data[symbol] = stock_data
+                print(f"Downloaded {len(stock_data)} days of data for {symbol}")
+            except Exception as e:
+                print(f"Error downloading data for {symbol}: {e}")
+                # Create dummy data
+                dummy_index = pd.date_range(start=start_date, end=end_date, freq='B')
+                stock_data = pd.DataFrame(index=dummy_index, 
+                                        columns=['Open', 'High', 'Low', 'Close', 'Volume'])
+                stock_data['Close'] = 100.0  # Default price
+                data[symbol] = stock_data
+    
         return data
     
     def _get_state(self):
@@ -198,18 +225,46 @@ class StockTradingEnvironment:
         
         # Current price, holdings and balance (normalized)
         for symbol in self.symbols:
-            current_price = self.data[symbol]['Close'].iloc[self.current_step]
-            state.append(current_price / 1000.0)  # Normalize price
-            state.append(self.shares[symbol] / 100.0)  # Normalize shares
+            try:
+                current_price = self.data[symbol]['Close'].iloc[self.current_step]
+                state.append(current_price / 1000.0)  # Normalize price
+                state.append(self.shares[symbol] / 100.0)  # Normalize shares
+            except IndexError as e:
+                print(f"Error accessing price data for {symbol} at step {self.current_step}")
+                print(f"Data length: {len(self.data[symbol])}")
+                raise e
         
         state.append(self.balance / self.initial_balance)  # Normalized balance
         
         # Historical price data
         for symbol in self.symbols:
-            prices = self.data[symbol]['Close'].iloc[self.current_step-self.lookback_window:self.current_step].values
-            # Normalize prices
-            normalized_prices = prices / prices.max()
-            state.extend(normalized_prices.tolist())
+            try:
+                # Make sure we have enough data
+                if self.current_step < self.lookback_window:
+                    print(f"Warning: Not enough history for {symbol}. Using available data.")
+                    available_data = self.data[symbol]['Close'].iloc[:self.current_step].values
+                    # Pad with the earliest available price if needed
+                    if len(available_data) > 0:
+                        padding = np.full(self.lookback_window - len(available_data), available_data[0])
+                        prices = np.concatenate([padding, available_data])
+                    else:
+                        # If no data at all, use a default value
+                        prices = np.full(self.lookback_window, 100.0)  # Default price
+                else:
+                    prices = self.data[symbol]['Close'].iloc[self.current_step-self.lookback_window:self.current_step].values
+                
+                # Avoid division by zero
+                price_max = prices.max()
+                if price_max == 0:
+                    normalized_prices = prices
+                else:
+                    normalized_prices = prices / price_max
+                    
+                state.extend(normalized_prices.tolist())
+            except Exception as e:
+                print(f"Error processing price history for {symbol}: {e}")
+                # Add placeholder data to maintain state vector size
+                state.extend([0.0] * self.lookback_window)
         
         return np.array(state)
     
