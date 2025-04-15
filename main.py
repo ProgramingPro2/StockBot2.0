@@ -35,7 +35,7 @@ TRAINING_EPISODES = 100  # Number of episodes for training
 TEST_EPISODES = 10  # Number of episodes for testing
 
 # RL model parameters
-STATE_DIM = len(STOCK_SYMBOLS) * (3 + LOOKBACK_WINDOW)  # Current price, shares, cash + price history
+STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)  # Price, holdings, balance, and price history
 ACTION_DIM = len(STOCK_SYMBOLS) * 3  # Buy, hold, sell for each stock
 LEARNING_RATE = 0.001
 GAMMA = 0.95  # Discount factor
@@ -78,10 +78,11 @@ class DRLAgent:
         
     def _build_actor(self):
         """Build policy network (actor) that selects actions"""
-        model = Sequential()
-        model.add(Dense(64, input_dim=self.state_dim, activation='relu'))
-        model.add(Dense(64, activation='relu'))
-        model.add(Dense(self.action_dim, activation='tanh'))  # Action values between -1 and 1
+        model = Sequential([
+            Dense(64, input_shape=(self.state_dim,), activation='relu'),
+            Dense(64, activation='relu'),
+            Dense(self.action_dim, activation='tanh')  # Action values between -1 and 1
+        ])
         model.compile(loss='mse', optimizer=optimizers.Adam(learning_rate=self.learning_rate))
         return model
     
@@ -110,7 +111,8 @@ class DRLAgent:
             return np.random.uniform(-1, 1, self.action_dim)
         
         # Exploitation: use the actor to predict actions
-        return self.actor.predict(state.reshape(1, -1))[0]
+        state_tensor = tf.convert_to_tensor(state.reshape(1, -1), dtype=tf.float32)
+        return self.actor(state_tensor).numpy()[0]
     
     def remember(self, state, action, reward, next_state, done):
         """Store experience in replay memory"""
@@ -123,26 +125,28 @@ class DRLAgent:
         
         states, actions, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
         
+        # Convert to tensors
+        states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
+        actions_tensor = tf.convert_to_tensor(actions, dtype=tf.float32)
+        rewards_tensor = tf.convert_to_tensor(rewards, dtype=tf.float32)
+        next_states_tensor = tf.convert_to_tensor(next_states, dtype=tf.float32)
+        dones_tensor = tf.convert_to_tensor(dones, dtype=tf.float32)
+        
         # Train critic
-        next_actions = self.actor.predict(next_states)
-        q_values = self.critic.predict([next_states, next_actions])
-        targets = rewards + self.gamma * q_values * (1 - dones)
-        self.critic.fit([states, actions], targets, epochs=1, verbose=0)
+        with tf.GradientTape() as tape:
+            next_actions = self.actor(next_states_tensor)
+            q_next = self.critic([next_states_tensor, next_actions])
+            q_targets = rewards_tensor + (1 - dones_tensor) * self.gamma * q_next
+            q_current = self.critic([states_tensor, actions_tensor])
+            critic_loss = tf.reduce_mean(tf.square(q_targets - q_current))
+        
+        critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
+        self.critic.optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
         
         # Train actor
-        a_for_grad = self.actor.predict(states)
-        critic_grads = np.zeros([BATCH_SIZE, self.action_dim])
-        
-        for i in range(BATCH_SIZE):
-            with tf.GradientTape() as tape:
-                tape.watch(a_for_grad[i:i+1])
-                q_values = self.critic([states[i:i+1], a_for_grad[i:i+1]])
-            critic_grads[i] = tape.gradient(q_values, a_for_grad[i:i+1])[0]
-        
-        # Apply actor gradients
         with tf.GradientTape() as tape:
-            actions = self.actor(states)
-            actor_loss = -tf.reduce_mean(self.critic([states, actions]))
+            actions_pred = self.actor(states_tensor)
+            actor_loss = -tf.reduce_mean(self.critic([states_tensor, actions_pred]))
         
         actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
         self.actor.optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
@@ -227,6 +231,9 @@ class StockTradingEnvironment:
         for symbol in self.symbols:
             try:
                 current_price = self.data[symbol]['Close'].iloc[self.current_step]
+                # Extract float value from pandas Series if needed
+                if hasattr(current_price, 'iloc'):
+                    current_price = current_price.iloc[0]
                 state.append(current_price / 1000.0)  # Normalize price
                 state.append(self.shares[symbol] / 100.0)  # Normalize shares
             except IndexError as e:
@@ -260,11 +267,27 @@ class StockTradingEnvironment:
                 else:
                     normalized_prices = prices / price_max
                     
-                state.extend(normalized_prices.tolist())
+                # Flatten any nested structures and ensure they're all scalars
+                for price in normalized_prices.tolist():
+                    if isinstance(price, (list, tuple, np.ndarray)):
+                        # If the price is still a container, take the first element
+                        state.append(float(price[0]))
+                    else:
+                        state.append(float(price))
             except Exception as e:
                 print(f"Error processing price history for {symbol}: {e}")
                 # Add placeholder data to maintain state vector size
                 state.extend([0.0] * self.lookback_window)
+        
+        # Final check to ensure all state elements are scalar
+        for i in range(len(state)):
+            if hasattr(state[i], "__len__") and not isinstance(state[i], (str, bytes)):
+                if hasattr(state[i], 'iloc'):  # Handle pandas Series
+                    state[i] = float(state[i].iloc[0])
+                elif len(state[i]) > 0:  # Handle list, array, etc.
+                    state[i] = float(state[i][0])
+                else:
+                    state[i] = 0.0  # Default for empty containers
         
         return np.array(state)
     
@@ -274,6 +297,12 @@ class StockTradingEnvironment:
         
         for symbol in self.symbols:
             current_price = self.data[symbol]['Close'].iloc[self.current_step]
+            # Convert to scalar if it's a Series
+            if hasattr(current_price, 'item'):
+                current_price = current_price.item()
+            elif isinstance(current_price, pd.Series):
+                current_price = current_price.iloc[0]
+            
             portfolio_value += self.shares[symbol] * current_price
         
         return portfolio_value
@@ -289,6 +318,11 @@ class StockTradingEnvironment:
             # hold_signal = action[action_idx + 2]  # Unused - for future extensions
             
             current_price = self.data[symbol]['Close'].iloc[self.current_step]
+            # Convert to scalar if it's a Series
+            if hasattr(current_price, 'item'):
+                current_price = current_price.item()
+            elif isinstance(current_price, pd.Series):
+                current_price = current_price.iloc[0]
             
             # Calculate shares to buy/sell based on the signal strength
             shares_to_buy = int(buy_signal * MAX_SHARES_PER_TRADE)
@@ -309,7 +343,7 @@ class StockTradingEnvironment:
         self.current_step += 1
         
         # Check if we've reached the end of our data
-        if self.current_step >= len(self.data[self.symbols[0]]) - 1:
+        if self.current_step >= min(len(self.data[symbol]) for symbol in self.symbols) - 1:
             self.done = True
         
         # Calculate reward as portfolio value change
@@ -348,21 +382,50 @@ class AlpacaTradingSystem:
         
         # Add current price and position data
         for symbol in self.symbols:
-            # Get current market data
-            barset = self.api.get_bars(symbol, tradeapi.TimeFrame.Day, start=start_date.isoformat(), end=end_date.isoformat())
-            current_price = barset[-1].c
-            
-            state.append(current_price / 1000.0)  # Normalize price
-            state.append(positions[symbol] / 100.0)  # Normalize position
+            try:
+                # Get current market data
+                barset = self.api.get_bars(symbol, tradeapi.TimeFrame.Day, start=start_date.isoformat(), end=end_date.isoformat())
+                if len(barset) > 0:
+                    current_price = barset[-1].c
+                else:
+                    # Fallback if no data is available
+                    print(f"No recent price data for {symbol}, using default price")
+                    current_price = 100.0
+                
+                state.append(current_price / 1000.0)  # Normalize price
+                state.append(positions[symbol] / 100.0)  # Normalize position
+            except Exception as e:
+                print(f"Error getting price data for {symbol}: {e}")
+                # Use default values
+                state.append(100.0 / 1000.0)  # Default normalized price
+                state.append(positions[symbol] / 100.0)  # Normalize position
         
         state.append(balance / INITIAL_BALANCE)  # Normalized balance
         
         # Add price history
         for symbol in self.symbols:
-            bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Day, start=start_date.isoformat(), end=end_date.isoformat())
-            prices = [bar.c for bar in bars[-LOOKBACK_WINDOW-1:-1]]
-            normalized_prices = np.array(prices) / max(prices)
-            state.extend(normalized_prices.tolist())
+            try:
+                bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Day, start=start_date.isoformat(), end=end_date.isoformat())
+                if len(bars) >= LOOKBACK_WINDOW:
+                    prices = [bar.c for bar in bars[-LOOKBACK_WINDOW:]]
+                else:
+                    # Pad with the earliest available price if needed
+                    print(f"Warning: Not enough history for {symbol}. Using available data.")
+                    available_prices = [bar.c for bar in bars]
+                    if len(available_prices) > 0:
+                        padding = [available_prices[0]] * (LOOKBACK_WINDOW - len(available_prices))
+                        prices = padding + available_prices
+                    else:
+                        prices = [100.0] * LOOKBACK_WINDOW  # Default price
+                
+                # Normalize prices
+                price_max = max(prices) if max(prices) > 0 else 1.0
+                normalized_prices = [p / price_max for p in prices]
+                state.extend(normalized_prices)
+            except Exception as e:
+                print(f"Error processing price history for {symbol}: {e}")
+                # Add placeholder data to maintain state vector size
+                state.extend([0.0] * LOOKBACK_WINDOW)
         
         return np.array(state)
     
