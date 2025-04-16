@@ -51,7 +51,7 @@ api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_vers
 STOCK_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "SPY", "TSLA", "NVDA", "INTC", "AMD"]
 INITIAL_BALANCE = 100000.0
 LOOKBACK_WINDOW = 10
-TRADING_FREQUENCY = "minute"
+TRADING_FREQUENCY = "hourly"
 MAX_SHARES_PER_TRADE = 100
 TRAINING_EPISODES = 1000
 TEST_EPISODES = 1000
@@ -768,72 +768,91 @@ def run_live_trading():
     # Create trading system
     trading_system = AlpacaTradingSystem(agent, STOCK_SYMBOLS)
     
-    # Check market status
-    clock = api.get_clock()
-    
-    logger.info("Starting live trading system...")
-    logger.info(f"Current Time: {clock.timestamp}")
-    logger.info(f"Market Open: {clock.is_open}")
-    
-    if not clock.is_open:
-        next_open = api.get_calendar(start=datetime.now().date().isoformat())[0].open
-        logger.info(f"Market is closed. Next opening at {next_open}")
-    
     # Main trading loop
     try:
+        max_retries = 5
+        retry_delay = 30  # seconds
+        
         while True:
-            clock = api.get_clock()
-            if clock.is_open:
-                logger.info("\n--- Executing Trades ---")
-                actions = trading_system.execute_trades()
-                
-                # Log the actions in a more readable format
-                action_summary = []
-                for i, symbol in enumerate(STOCK_SYMBOLS):
-                    action_idx = i * 3
-                    buy_signal = max(0, actions[action_idx])
-                    sell_signal = max(0, -actions[action_idx + 1])
-                    if buy_signal > 0.1:
-                        action_summary.append(f"BUY {symbol}: {buy_signal:.2f}")
-                    elif sell_signal > 0.1:
-                        action_summary.append(f"SELL {symbol}: {sell_signal:.2f}")
-                
-                if action_summary:
-                    logger.info(f"Actions taken: {', '.join(action_summary)}")
-                else:
-                    logger.info("No significant trading actions taken")
-                
-                # Get current portfolio value
-                account = api.get_account()
-                equity = float(account.equity)
-                logger.info(f"Current Portfolio Value: ${equity:.2f}")
-                
-                # Sleep until next trading decision
-                if TRADING_FREQUENCY == "daily":
-                    # Check time to market close
-                    time_to_close = (clock.next_close - clock.timestamp).total_seconds()
-                    if time_to_close < 60*60:  # If less than 1 hour to close
-                        logger.info(f"Market closing soon. Sleeping until next market open.")
-                        time.sleep(time_to_close + 60*60)  # Sleep until next day
+            # Get market status with retry logic
+            for attempt in range(max_retries):
+                try:
+                    clock = api.get_clock()
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"API connection failed (attempt {attempt+1}/{max_retries}): {e}")
+                        logger.info(f"Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
                     else:
-                        logger.info("Waiting for next trading window...")
-                        time.sleep(60*60)  # Check every hour
-                elif TRADING_FREQUENCY == "hourly":
-                    logger.info("Waiting for next hourly window...")
-                    time.sleep(60*60)  # Sleep for 1 hour
-                else:  # "minute"
-                    logger.info("Waiting for next minute window...")
-                    time.sleep(60)  # Sleep for 1 minute
-            else:
-                logger.info("Market is closed. Waiting for market to open...")
-                time.sleep(60*60)  # Check every hour if market opened
+                        logger.error(f"Failed to connect to API after {max_retries} attempts: {e}")
+                        # Wait longer before trying again to avoid hammering the API
+                        time.sleep(300)  # 5 minutes
+                        retry_delay = 30  # Reset delay
+                        continue
+            
+            try:
+                if clock.is_open:
+                    logger.info("\n--- Executing Trades ---")
+                    actions = trading_system.execute_trades()
+                    
+                    # Log the actions in a more readable format
+                    action_summary = []
+                    for i, symbol in enumerate(STOCK_SYMBOLS):
+                        action_idx = i * 3
+                        buy_signal = max(0, actions[action_idx])
+                        sell_signal = max(0, -actions[action_idx + 1])
+                        if buy_signal > 0.1:
+                            action_summary.append(f"BUY {symbol}: {buy_signal:.2f}")
+                        elif sell_signal > 0.1:
+                            action_summary.append(f"SELL {symbol}: {sell_signal:.2f}")
+                    
+                    if action_summary:
+                        logger.info(f"Actions taken: {', '.join(action_summary)}")
+                    else:
+                        logger.info("No significant trading actions taken")
+                    
+                    # Get current portfolio value with retry logic
+                    for attempt in range(max_retries):
+                        try:
+                            account = api.get_account()
+                            equity = float(account.equity)
+                            logger.info(f"Current Portfolio Value: ${equity:.2f}")
+                            break
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Failed to get account info (attempt {attempt+1}/{max_retries}): {e}")
+                                time.sleep(retry_delay)
+                            else:
+                                logger.error(f"Failed to get account info after {max_retries} attempts")
+                    
+                    # Sleep until next trading decision
+                    if TRADING_FREQUENCY == "daily":
+                        # Check time to market close
+                        time_to_close = (clock.next_close - clock.timestamp).total_seconds()
+                        if time_to_close < 60*60:  # If less than 1 hour to close
+                            logger.info(f"Market closing soon. Sleeping until next market open.")
+                            time.sleep(time_to_close + 60*60)  # Sleep until next day
+                        else:
+                            logger.info("Waiting for next trading window...")
+                            time.sleep(60*60)  # Check every hour
+                    elif TRADING_FREQUENCY == "hourly":
+                        logger.info("Waiting for next hourly window...")
+                        time.sleep(60*60)  # Sleep for 1 hour
+                    else:  # "minute"
+                        logger.info("Waiting for next minute window...")
+                        time.sleep(60)  # Sleep for 1 minute
+                else:
+                    logger.info("Market is closed. Waiting for market to open...")
+                    time.sleep(60*60)  # Check every hour if market opened
+            except Exception as e:
+                logger.error(f"Error during trading operations: {e}")
+                # Add a delay to prevent rapid retries if there's a persistent error
+                time.sleep(60)
     
     except KeyboardInterrupt:
         logger.info("Trading session terminated by user")
-    except Exception as e:
-        logger.error(f"Error in trading loop: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
 
 def run_parallel_training(num_processes=None):
     """
