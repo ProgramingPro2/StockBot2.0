@@ -51,7 +51,7 @@ api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_vers
 STOCK_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "SPY", "TSLA", "NVDA", "INTC", "AMD"]
 INITIAL_BALANCE = 100000.0
 LOOKBACK_WINDOW = 10
-TRADING_FREQUENCY = "hourly"
+TRADING_FREQUENCY = "minute"
 MAX_SHARES_PER_TRADE = 100
 TRAINING_EPISODES = 1000
 TEST_EPISODES = 1000
@@ -310,17 +310,21 @@ class StockTradingEnvironment:
         self.portfolio_value_history = [self.initial_balance]
         
         return self._get_state()
-    
+        
     def _get_data(self):
-        """Get historical stock data for all symbols with caching"""
+        """Get historical stock data for all symbols with caching using yfinance"""
         end_date = datetime.now()
         # Get more data to ensure we have enough for lookback
         start_date = end_date - timedelta(days=365 + self.lookback_window * 2)
         
+        # Format dates as strings for consistent caching
+        end_date_str = end_date.strftime('%Y-%m-%d')
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        
         data = {}
         for symbol in self.symbols:
             # Check if data is already cached
-            cache_file = CACHE_DIR / f"{symbol}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.pkl"
+            cache_file = CACHE_DIR / f"{symbol}_{start_date_str}_{end_date_str}.pkl"
             
             if cache_file.exists():
                 try:
@@ -332,9 +336,40 @@ class StockTradingEnvironment:
                     logger.warning(f"Failed to load cached data for {symbol}: {e}")
             
             try:
-                # Use yfinance to get historical data
+                # Use yfinance to get historical data with error handling
                 logger.info(f"Downloading data for {symbol}...")
-                stock_data = yf.download(symbol, start=start_date, end=end_date, progress=False)
+                
+                # Try multiple approaches to get data
+                attempts = 0
+                max_attempts = 3
+                while attempts < max_attempts:
+                    try:
+                        stock_data = yf.download(
+                            symbol, 
+                            start=start_date_str, 
+                            end=end_date_str, 
+                            progress=False,
+                            threads=False  # Disable multi-threading to avoid conflicts
+                        )
+                        
+                        if len(stock_data) > 0:
+                            break  # Successful download
+                        
+                        # Try with a different range if first attempt failed
+                        stock_data = yf.download(
+                            symbol, 
+                            period="1y",  # Use period instead of date range
+                            progress=False,
+                            threads=False
+                        )
+                        
+                        if len(stock_data) > 0:
+                            break  # Successful download
+                            
+                    except Exception as e:
+                        logger.warning(f"Attempt {attempts+1} failed for {symbol}: {e}")
+                        attempts += 1
+                        time.sleep(2)  # Add delay between attempts
                 
                 if len(stock_data) == 0:
                     logger.warning(f"No data available for {symbol}")
@@ -359,7 +394,7 @@ class StockTradingEnvironment:
                                         columns=['Open', 'High', 'Low', 'Close', 'Volume'])
                 stock_data['Close'] = 100.0  # Default price
                 data[symbol] = stock_data
-    
+
         return data
     
     def _get_state(self):
@@ -499,38 +534,58 @@ class AlpacaTradingSystem:
         self.api = api
         
     def _get_current_state(self):
-        """Create the current state based on market data and account info"""
+        """Create the current state based on market data and account info using yfinance instead of Alpaca API"""
         state = []
         
-        # Get account information
-        account = self.api.get_account()
-        balance = float(account.cash)
+        # Get account information from Alpaca (still needed for balance/positions)
+        try:
+            account = self.api.get_account()
+            balance = float(account.cash)
+        except Exception as e:
+            logger.error(f"Error getting account info: {e}")
+            balance = INITIAL_BALANCE  # Use default if API fails
         
-        # Get current positions
+        # Get current positions from Alpaca
         positions = {sym: 0 for sym in self.symbols}
-        current_positions = self.api.list_positions()
-        for position in current_positions:
-            if position.symbol in self.symbols:
-                positions[position.symbol] = int(position.qty)
+        try:
+            current_positions = self.api.list_positions()
+            for position in current_positions:
+                if position.symbol in self.symbols:
+                    positions[position.symbol] = int(position.qty)
+        except Exception as e:
+            logger.error(f"Error getting positions: {e}")
         
-        # Get current prices
+        # Use yfinance to get price data
         end_date = datetime.now()
         start_date = end_date - timedelta(days=LOOKBACK_WINDOW + 5)  # Add buffer days
         
-        # Add current price and position data
+        # Format dates for yfinance
+        start_date_str = start_date.strftime('%Y-%m-%d')
+        end_date_str = end_date.strftime('%Y-%m-%d')
+        
+        # First add current price data
         for symbol in self.symbols:
             try:
-                # Get current market data
-                barset = self.api.get_bars(symbol, tradeapi.TimeFrame.Day, start=start_date.isoformat(), end=end_date.isoformat())
-                if len(barset) > 0:
-                    current_price = barset[-1].c
+                # Get current price using yfinance
+                ticker_data = yf.Ticker(symbol)
+                current_data = ticker_data.history(period="1d")
+                
+                if not current_data.empty:
+                    current_price = current_data['Close'].iloc[-1]
                 else:
-                    # Fallback if no data is available
-                    logger.warning(f"No recent price data for {symbol}, using default price")
-                    current_price = 100.0
+                    # Try downloading with a different method
+                    df = yf.download(symbol, period="1d", progress=False)
+                    if not df.empty:
+                        current_price = df['Close'].iloc[-1]
+                    else:
+                        logger.warning(f"No price data for {symbol}, using default price")
+                        current_price = 100.0
                 
                 state.append(current_price / 1000.0)  # Normalize price
                 state.append(positions[symbol] / 100.0)  # Normalize position
+                
+                logger.info(f"Current price for {symbol}: ${current_price:.2f}")
+                
             except Exception as e:
                 logger.error(f"Error getting price data for {symbol}: {e}")
                 # Use default values
@@ -539,26 +594,33 @@ class AlpacaTradingSystem:
         
         state.append(balance / INITIAL_BALANCE)  # Normalized balance
         
-        # Add price history
+        # Add historical price data
         for symbol in self.symbols:
             try:
-                bars = self.api.get_bars(symbol, tradeapi.TimeFrame.Day, start=start_date.isoformat(), end=end_date.isoformat())
-                if len(bars) >= LOOKBACK_WINDOW:
-                    prices = [bar.c for bar in bars[-LOOKBACK_WINDOW:]]
+                # Get historical data using yfinance
+                hist_data = yf.download(
+                    symbol, 
+                    start=start_date_str,
+                    end=end_date_str,
+                    progress=False
+                )
+                
+                if not hist_data.empty and len(hist_data) >= LOOKBACK_WINDOW:
+                    prices = hist_data['Close'].values[-LOOKBACK_WINDOW:]
                 else:
-                    # Pad with the earliest available price if needed
                     logger.warning(f"Not enough history for {symbol}. Using available data.")
-                    available_prices = [bar.c for bar in bars]
-                    if len(available_prices) > 0:
-                        padding = [available_prices[0]] * (LOOKBACK_WINDOW - len(available_prices))
-                        prices = padding + available_prices
+                    if not hist_data.empty:
+                        available_prices = hist_data['Close'].values
+                        padding = np.full(LOOKBACK_WINDOW - len(available_prices), available_prices[0] if len(available_prices) > 0 else 100.0)
+                        prices = np.concatenate([padding, available_prices])
                     else:
-                        prices = [100.0] * LOOKBACK_WINDOW  # Default price
+                        prices = np.full(LOOKBACK_WINDOW, 100.0)  # Default price
                 
                 # Normalize prices
                 price_max = max(prices) if max(prices) > 0 else 1.0
-                normalized_prices = [p / price_max for p in prices]
+                normalized_prices = [float(p) / price_max for p in prices]
                 state.extend(normalized_prices)
+                
             except Exception as e:
                 logger.error(f"Error processing price history for {symbol}: {e}")
                 # Add placeholder data to maintain state vector size
@@ -567,12 +629,28 @@ class AlpacaTradingSystem:
         return np.array(state, dtype=np.float32)
     
     def execute_trades(self):
-        """Execute trades based on agent's decisions"""
+        """Execute trades based on agent's decisions while avoiding wash trades"""
         # Get current state
         state = self._get_current_state()
         
         # Get actions from agent (no exploration in live trading)
         actions = self.agent.act(state, explore=False)
+        
+        # Get current positions to avoid wash trades
+        positions = {}
+        try:
+            current_positions = self.api.list_positions()
+            for position in current_positions:
+                positions[position.symbol] = {
+                    'qty': int(position.qty),
+                    'last_trade': datetime.now() - timedelta(hours=24)  # Default to 24h ago
+                }
+        except Exception as e:
+            logger.error(f"Error getting positions: {e}")
+            positions = {sym: {'qty': 0, 'last_trade': datetime.now() - timedelta(hours=24)} for sym in self.symbols}
+        
+        # Create trading log for this cycle
+        trade_actions = []
         
         # Execute actions
         for i, symbol in enumerate(self.symbols):
@@ -580,10 +658,19 @@ class AlpacaTradingSystem:
             buy_signal = max(0, actions[action_idx])
             sell_signal = max(0, -actions[action_idx + 1])
             
+            # Avoid wash trades: only do buy or sell in a single cycle, not both
+            if buy_signal > 0.2 and sell_signal > 0.2:
+                if buy_signal > sell_signal:
+                    sell_signal = 0
+                    logger.info(f"Prevented wash trade for {symbol} - choosing buy over sell")
+                else:
+                    buy_signal = 0
+                    logger.info(f"Prevented wash trade for {symbol} - choosing sell over buy")
+            
             # Get current position
             try:
-                position = self.api.get_position(symbol)
-                current_shares = int(position.qty)
+                position = positions.get(symbol, {'qty': 0})
+                current_shares = position.get('qty', 0)
             except:
                 current_shares = 0
             
@@ -594,6 +681,13 @@ class AlpacaTradingSystem:
             # Execute buy order
             if shares_to_buy > 0:
                 try:
+                    # Get latest price with yfinance before placing order
+                    ticker_data = yf.Ticker(symbol)
+                    latest_data = ticker_data.history(period="1d")
+                    if not latest_data.empty:
+                        current_price = latest_data['Close'].iloc[-1]
+                        logger.info(f"Latest price for {symbol}: ${current_price:.2f}")
+                    
                     self.api.submit_order(
                         symbol=symbol,
                         qty=shares_to_buy,
@@ -602,8 +696,21 @@ class AlpacaTradingSystem:
                         time_in_force='day'
                     )
                     logger.info(f"BUY ORDER: {shares_to_buy} shares of {symbol}")
+                    trade_actions.append(f"BUY {symbol}: {shares_to_buy} shares")
+                    
+                    # Update position tracking
+                    if symbol not in positions:
+                        positions[symbol] = {'qty': shares_to_buy, 'last_trade': datetime.now()}
+                    else:
+                        positions[symbol]['qty'] = positions[symbol].get('qty', 0) + shares_to_buy
+                        positions[symbol]['last_trade'] = datetime.now()
+                        
                 except Exception as e:
                     logger.error(f"Buy order failed for {symbol}: {e}")
+            
+            # Wait a few seconds between buy and sell to avoid wash trade detection
+            if shares_to_buy > 0 and shares_to_sell > 0:
+                time.sleep(5)
             
             # Execute sell order
             if shares_to_sell > 0:
@@ -616,8 +723,28 @@ class AlpacaTradingSystem:
                         time_in_force='day'
                     )
                     logger.info(f"SELL ORDER: {shares_to_sell} shares of {symbol}")
+                    trade_actions.append(f"SELL {symbol}: {shares_to_sell} shares")
+                    
+                    # Update position tracking
+                    if symbol in positions:
+                        positions[symbol]['qty'] = max(0, positions[symbol].get('qty', 0) - shares_to_sell)
+                        positions[symbol]['last_trade'] = datetime.now()
+                        
                 except Exception as e:
                     logger.error(f"Sell order failed for {symbol}: {e}")
+        
+        if trade_actions:
+            logger.info(f"Actions taken: {', '.join(trade_actions)}")
+        else:
+            logger.info("No significant trading actions taken")
+        
+        # Get updated portfolio value
+        try:
+            account = self.api.get_account()
+            equity = float(account.equity)
+            logger.info(f"Current Portfolio Value: ${equity:.2f}")
+        except Exception as e:
+            logger.error(f"Failed to get account info: {e}")
         
         return actions
 
@@ -757,6 +884,44 @@ def test_agent(agent=None):
     
     return agent
 
+def invalidate_cache(symbols=None, days=1):
+    """
+    Invalidates cache files for the specified symbols or all symbols
+    that are older than the specified number of days
+    
+    Args:
+        symbols: List of symbols to invalidate cache for, or None for all
+        days: Number of days to consider for cache invalidation
+    """
+    if symbols is None:
+        symbols = STOCK_SYMBOLS
+    
+    # Get current date
+    now = datetime.now()
+    cutoff_time = now - timedelta(days=days)
+    
+    invalidated_count = 0
+    
+    for cache_file in CACHE_DIR.glob("*.pkl"):
+        # Only process files for the specified symbols
+        symbol_match = False
+        for symbol in symbols:
+            if symbol in cache_file.name:
+                symbol_match = True
+                break
+        
+        if not symbol_match:
+            continue
+        
+        # Check file modification time
+        mod_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
+        if mod_time < cutoff_time:
+            cache_file.unlink()  # Delete the file
+            invalidated_count += 1
+            logger.info(f"Invalidated cache file: {cache_file.name}")
+    
+    logger.info(f"Cache invalidation complete. Removed {invalidated_count} files.")
+    
 def run_live_trading():
     """Run the agent in live trading mode with Alpaca"""
     # Load trained agent
@@ -768,12 +933,26 @@ def run_live_trading():
     # Create trading system
     trading_system = AlpacaTradingSystem(agent, STOCK_SYMBOLS)
     
+    # Invalidate cache at the start to ensure fresh data
+    invalidate_cache(days=1)
+    
+    # Variables for tracking time since last cache invalidation
+    last_cache_invalidation = datetime.now()
+    cache_invalidation_interval = timedelta(hours=4)  # Invalidate every 4 hours
+    
     # Main trading loop
     try:
         max_retries = 5
         retry_delay = 30  # seconds
         
         while True:
+            # Check if it's time to invalidate cache
+            now = datetime.now()
+            if now - last_cache_invalidation > cache_invalidation_interval:
+                invalidate_cache(days=1)
+                last_cache_invalidation = now
+                logger.info("Performed regular cache invalidation")
+            
             # Get market status with retry logic
             for attempt in range(max_retries):
                 try:
