@@ -29,10 +29,10 @@ api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_vers
 STOCK_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "SPY", "TSLA", "NVDA", "INTC", "AMD"]  # Stocks to trade
 INITIAL_BALANCE = 100000.0  # Initial portfolio value
 LOOKBACK_WINDOW = 10  # Number of past days to consider for state
-TRADING_FREQUENCY = "daily"  # or "hourly", "minute" 
+TRADING_FREQUENCY = "minute"  # or "hourly", "minute" 
 MAX_SHARES_PER_TRADE = 100  # Maximum number of shares per trade
-TRAINING_EPISODES = 100  # Number of episodes for training
-TEST_EPISODES = 10  # Number of episodes for testing
+TRAINING_EPISODES = 1000  # Number of episodes for training
+TEST_EPISODES = 1000  # Number of episodes for testing
 
 # RL model parameters
 STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)  # Price, holdings, balance, and price history
