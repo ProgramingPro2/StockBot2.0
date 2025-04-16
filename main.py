@@ -246,11 +246,11 @@ class DRLAgent:
         return actor_path, critic_path
     
     def load_models(self, path=None):
-        """Load actor and critic models"""
         if path and os.path.exists(f"{path}/actor_model.h5") and os.path.exists(f"{path}/critic_model.h5"):
-            # Load from Keras format
-            self.actor = load_model(f"{path}/actor_model.h5")
-            self.critic = load_model(f"{path}/critic_model.h5")
+            import tensorflow as tf
+            # Try with metrics instead of losses
+            self.actor = load_model(f"{path}/actor_model.h5", custom_objects={'mse': tf.keras.metrics.MeanSquaredError()})
+            self.critic = load_model(f"{path}/critic_model.h5", custom_objects={'mse': tf.keras.metrics.MeanSquaredError()})
             logger.info(f"Models loaded from {path}")
             
             # Important: Recreate optimizers with the new model variables
