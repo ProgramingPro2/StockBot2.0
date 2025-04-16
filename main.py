@@ -1,7 +1,3 @@
-# Stock Trading AI with Alpaca API and Deep RL
-# This script integrates Alpaca API with a Deep Reinforcement Learning model
-# based on https://github.com/Albert-Z-Guo/Deep-Reinforcement-Stock-Trading
-
 import os
 import pandas as pd
 import numpy as np
@@ -15,6 +11,32 @@ from tensorflow.keras import optimizers
 import matplotlib.pyplot as plt
 import yfinance as yf
 import dotenv
+import joblib
+from pathlib import Path
+import logging
+from tqdm import tqdm
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configure GPU memory growth to avoid memory allocation issues
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Currently, memory growth needs to be the same across GPUs
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logger.info(f"GPU is available. Found {len(gpus)} GPU(s)")
+    except RuntimeError as e:
+        logger.warning(f"Memory growth setting failed: {e}")
+else:
+    logger.info("No GPU available, using CPU for training")
+
+# Enable eager execution
+tf.config.run_functions_eagerly(True)
+
+# Load environment variables
 dotenv.load_dotenv()
 
 # Set up Alpaca API credentials
@@ -26,21 +48,25 @@ ALPACA_BASE_URL = 'https://paper-api.alpaca.markets'
 api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version='v2')
 
 # Configuration parameters
-STOCK_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "SPY", "TSLA", "NVDA", "INTC", "AMD"]  # Stocks to trade
-INITIAL_BALANCE = 100000.0  # Initial portfolio value
-LOOKBACK_WINDOW = 10  # Number of past days to consider for state
-TRADING_FREQUENCY = "minute"  # or "hourly", "minute" 
-MAX_SHARES_PER_TRADE = 100  # Maximum number of shares per trade
-TRAINING_EPISODES = 1000  # Number of episodes for training
-TEST_EPISODES = 1000  # Number of episodes for testing
+STOCK_SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "SPY", "TSLA", "NVDA", "INTC", "AMD"]
+INITIAL_BALANCE = 100000.0
+LOOKBACK_WINDOW = 10
+TRADING_FREQUENCY = "minute"
+MAX_SHARES_PER_TRADE = 100
+TRAINING_EPISODES = 1000
+TEST_EPISODES = 1000
+
+# Cache directory for stock data
+CACHE_DIR = Path("./data_cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
 # RL model parameters
-STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)  # Price, holdings, balance, and price history
-ACTION_DIM = len(STOCK_SYMBOLS) * 3  # Buy, hold, sell for each stock
+STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)
+ACTION_DIM = len(STOCK_SYMBOLS) * 3
 LEARNING_RATE = 0.001
-GAMMA = 0.95  # Discount factor
-BATCH_SIZE = 32
-MEMORY_SIZE = 10000
+GAMMA = 0.95
+BATCH_SIZE = 128  # Increased batch size for better GPU utilization
+MEMORY_SIZE = 100000  # Increased memory size for better experience diversity
 
 class ReplayBuffer:
     def __init__(self, capacity):
@@ -61,6 +87,18 @@ class ReplayBuffer:
     
     def __len__(self):
         return len(self.buffer)
+    
+    def save(self, path):
+        """Save replay buffer to disk"""
+        joblib.dump(self.buffer, path)
+    
+    def load(self, path):
+        """Load replay buffer from disk"""
+        if os.path.exists(path):
+            self.buffer = joblib.load(path)
+            self.position = len(self.buffer) % self.capacity
+            return True
+        return False
 
 class DRLAgent:
     def __init__(self, state_dim, action_dim, learning_rate=0.001):
@@ -73,36 +111,77 @@ class DRLAgent:
         self.epsilon_decay = 0.995
         self.learning_rate = learning_rate
         
+        # Create separate optimizers for actor and critic
+        self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        
+        # Build models
         self.actor = self._build_actor()
         self.critic = self._build_critic()
+        
+        # TensorFlow checkpoint for saving models
+        self.checkpoint_dir = "./checkpoints"
+        Path(self.checkpoint_dir).mkdir(exist_ok=True)
+        self.actor_checkpoint = tf.train.Checkpoint(model=self.actor, optimizer=self.actor_optimizer)
+        self.critic_checkpoint = tf.train.Checkpoint(model=self.critic, optimizer=self.critic_optimizer)
+        self.actor_manager = tf.train.CheckpointManager(
+            self.actor_checkpoint, directory=f"{self.checkpoint_dir}/actor", max_to_keep=3
+        )
+        self.critic_manager = tf.train.CheckpointManager(
+            self.critic_checkpoint, directory=f"{self.checkpoint_dir}/critic", max_to_keep=3
+        )
         
     def _build_actor(self):
         """Build policy network (actor) that selects actions"""
         model = Sequential([
-            Dense(64, input_shape=(self.state_dim,), activation='relu'),
+            Dense(128, input_shape=(self.state_dim,), activation='relu'),
+            Dense(128, activation='relu'),
             Dense(64, activation='relu'),
-            Dense(self.action_dim, activation='tanh')  # Action values between -1 and 1
+            Dense(self.action_dim, activation='tanh')
         ])
-        model.compile(loss='mse', optimizer=optimizers.Adam(learning_rate=self.learning_rate))
+        model.compile(loss='mse', optimizer=self.actor_optimizer)
         return model
-    
+
     def _build_critic(self):
         """Build value network (critic) that estimates Q-values"""
         state_input = Input(shape=(self.state_dim,))
         action_input = Input(shape=(self.action_dim,))
         
-        state_h1 = Dense(64, activation='relu')(state_input)
-        state_h2 = Dense(32, activation='relu')(state_h1)
+        state_h1 = Dense(128, activation='relu')(state_input)
+        state_h2 = Dense(64, activation='relu')(state_h1)
         
-        action_h1 = Dense(32, activation='relu')(action_input)
+        action_h1 = Dense(64, activation='relu')(action_input)
         
         merged = concatenate([state_h2, action_h1])
-        merged_h1 = Dense(32, activation='relu')(merged)
-        output = Dense(1, activation='linear')(merged_h1)
+        merged_h1 = Dense(64, activation='relu')(merged)
+        merged_h2 = Dense(32, activation='relu')(merged_h1)
+        output = Dense(1, activation='linear')(merged_h2)
         
         model = Model(inputs=[state_input, action_input], outputs=output)
-        model.compile(loss='mse', optimizer=optimizers.Adam(learning_rate=self.learning_rate))
+        model.compile(loss='mse', optimizer=self.critic_optimizer)
         return model
+    
+    @tf.function
+    def _actor_train_step(self, states):
+        """TensorFlow function for actor training step"""
+        with tf.GradientTape() as tape:
+            actions_pred = self.actor(states, training=True)
+            actor_loss = -tf.reduce_mean(self.critic([states, actions_pred], training=True))
+        
+        actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
+        self.actor_optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
+        return actor_loss
+
+    @tf.function
+    def _critic_train_step(self, states, actions, q_targets):
+        """TensorFlow function for critic training step"""
+        with tf.GradientTape() as tape:
+            q_values = self.critic([states, actions], training=True)
+            critic_loss = tf.reduce_mean(tf.square(q_targets - q_values))
+        
+        critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
+        self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
+        return critic_loss
     
     def act(self, state, explore=True):
         """Choose an action based on the current state"""
@@ -132,51 +211,92 @@ class DRLAgent:
         next_states_tensor = tf.convert_to_tensor(next_states, dtype=tf.float32)
         dones_tensor = tf.convert_to_tensor(dones, dtype=tf.float32)
         
-        # Train critic
-        with tf.GradientTape() as tape:
-            next_actions = self.actor(next_states_tensor)
-            q_next = self.critic([next_states_tensor, next_actions])
-            q_targets = rewards_tensor + (1 - dones_tensor) * self.gamma * q_next
-            q_current = self.critic([states_tensor, actions_tensor])
-            critic_loss = tf.reduce_mean(tf.square(q_targets - q_current))
+        # Calculate target Q-values in a single batch
+        next_actions = self.actor(next_states_tensor)
+        q_next = self.critic([next_states_tensor, next_actions])
+        q_targets = rewards_tensor + (1 - dones_tensor) * self.gamma * q_next[:, 0]
         
-        critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
-        self.critic.optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
+        # Train critic using optimized function
+        critic_loss = self._critic_train_step(states_tensor, actions_tensor, tf.expand_dims(q_targets, axis=1))
         
-        # Train actor
-        with tf.GradientTape() as tape:
-            actions_pred = self.actor(states_tensor)
-            actor_loss = -tf.reduce_mean(self.critic([states_tensor, actions_pred]))
-        
-        actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
-        self.actor.optimizer.apply_gradients(zip(actor_grads, self.actor.trainable_variables))
+        # Train actor using optimized function
+        actor_loss = self._actor_train_step(states_tensor)
         
         # Decay epsilon
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+        
+        return {"critic_loss": critic_loss.numpy(), "actor_loss": actor_loss.numpy()}
     
-    def save_models(self, path):
-        """Save actor and critic models"""
-        self.actor.save(f"{path}/actor_model.h5")
-        self.critic.save(f"{path}/critic_model.h5")
+    def save_models(self, path=None):
+        """Save actor and critic models using TensorFlow checkpoints"""
+        if path:
+            # Save models in Keras format
+            self.actor.save(f"{path}/actor_model.h5")
+            self.critic.save(f"{path}/critic_model.h5")
+        
+        # Save in checkpoint format
+        actor_path = self.actor_manager.save()
+        critic_path = self.critic_manager.save()
+        
+        # Save replay buffer
+        self.memory.save(f"{self.checkpoint_dir}/replay_buffer.pkl")
+        
+        logger.info(f"Models saved to {actor_path} and {critic_path}")
+        return actor_path, critic_path
     
-    def load_models(self, path):
+    def load_models(self, path=None):
         """Load actor and critic models"""
-        self.actor = load_model(f"{path}/actor_model.h5")
-        self.critic = load_model(f"{path}/critic_model.h5")
+        if path and os.path.exists(f"{path}/actor_model.h5") and os.path.exists(f"{path}/critic_model.h5"):
+            # Load from Keras format
+            self.actor = load_model(f"{path}/actor_model.h5")
+            self.critic = load_model(f"{path}/critic_model.h5")
+            logger.info(f"Models loaded from {path}")
+            
+            # Important: Recreate optimizers with the new model variables
+            self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
+            self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
+            
+            # Needed for optimizer to know about the variables
+            dummy_state = np.zeros((1, self.state_dim), dtype=np.float32)
+            dummy_action = np.zeros((1, self.action_dim), dtype=np.float32)
+            
+            # Initialize the optimizer with model variables
+            with tf.GradientTape() as tape:
+                actions_pred = self.actor(dummy_state)
+                _ = self.critic([dummy_state, dummy_action])
+            
+            # Try to load replay buffer
+            buffer_path = f"{self.checkpoint_dir}/replay_buffer.pkl"
+            if self.memory.load(buffer_path):
+                logger.info(f"Replay buffer loaded from {buffer_path}")
+            
+            return True
+        else:
+            # Try loading from checkpoint
+            actor_status = self.actor_checkpoint.restore(self.actor_manager.latest_checkpoint)
+            critic_status = self.critic_checkpoint.restore(self.critic_manager.latest_checkpoint)
+            
+            if self.actor_manager.latest_checkpoint and self.critic_manager.latest_checkpoint:
+                logger.info(f"Models restored from checkpoints")
+                return True
+            else:
+                logger.warning("No models found to load")
+                return False
 
 class StockTradingEnvironment:
     def __init__(self, symbols, initial_balance, lookback_window):
         self.symbols = symbols
         self.initial_balance = initial_balance
         self.lookback_window = lookback_window
+        self.data_cache = {}
         self.reset()
         
     def reset(self):
         """Reset the environment for new episode"""
         self.balance = self.initial_balance
         self.shares = {symbol: 0 for symbol in self.symbols}
-        self.data = self._download_data()
+        self.data = self._get_data()
         
         # Ensure we have enough data for lookback window
         min_data_length = min([len(self.data[symbol]) for symbol in self.symbols])
@@ -184,36 +304,55 @@ class StockTradingEnvironment:
         # Set current step to lookback_window or to data length if not enough data
         self.current_step = min(self.lookback_window, min_data_length - 1)
         if self.current_step < self.lookback_window:
-            print(f"Warning: Not enough data for full lookback window. Using {self.current_step} days instead.")
+            logger.warning(f"Not enough data for full lookback window. Using {self.current_step} days instead.")
         
         self.done = False
         self.portfolio_value_history = [self.initial_balance]
         
         return self._get_state()
     
-    def _download_data(self):
-        """Download historical stock data for all symbols"""
+    def _get_data(self):
+        """Get historical stock data for all symbols with caching"""
         end_date = datetime.now()
         # Get more data to ensure we have enough for lookback
-        start_date = end_date - timedelta(days=365 + self.lookback_window * 2)  
+        start_date = end_date - timedelta(days=365 + self.lookback_window * 2)
         
         data = {}
         for symbol in self.symbols:
+            # Check if data is already cached
+            cache_file = CACHE_DIR / f"{symbol}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.pkl"
+            
+            if cache_file.exists():
+                try:
+                    stock_data = pd.read_pickle(cache_file)
+                    logger.info(f"Loaded cached data for {symbol} from {cache_file}")
+                    data[symbol] = stock_data
+                    continue
+                except Exception as e:
+                    logger.warning(f"Failed to load cached data for {symbol}: {e}")
+            
             try:
                 # Use yfinance to get historical data
-                stock_data = yf.download(symbol, start=start_date, end=end_date)
+                logger.info(f"Downloading data for {symbol}...")
+                stock_data = yf.download(symbol, start=start_date, end=end_date, progress=False)
+                
                 if len(stock_data) == 0:
-                    print(f"Warning: No data available for {symbol}")
+                    logger.warning(f"No data available for {symbol}")
                     # Create dummy data as fallback
                     dummy_index = pd.date_range(start=start_date, end=end_date, freq='B')
                     stock_data = pd.DataFrame(index=dummy_index, 
                                             columns=['Open', 'High', 'Low', 'Close', 'Volume'])
                     stock_data['Close'] = 100.0  # Default price
                     stock_data.fillna(method='ffill', inplace=True)
+                
+                # Cache the data
+                stock_data.to_pickle(cache_file)
+                logger.info(f"Downloaded and cached {len(stock_data)} days of data for {symbol}")
+                
                 data[symbol] = stock_data
-                print(f"Downloaded {len(stock_data)} days of data for {symbol}")
+                
             except Exception as e:
-                print(f"Error downloading data for {symbol}: {e}")
+                logger.error(f"Error downloading data for {symbol}: {e}")
                 # Create dummy data
                 dummy_index = pd.date_range(start=start_date, end=end_date, freq='B')
                 stock_data = pd.DataFrame(index=dummy_index, 
@@ -237,8 +376,8 @@ class StockTradingEnvironment:
                 state.append(current_price / 1000.0)  # Normalize price
                 state.append(self.shares[symbol] / 100.0)  # Normalize shares
             except IndexError as e:
-                print(f"Error accessing price data for {symbol} at step {self.current_step}")
-                print(f"Data length: {len(self.data[symbol])}")
+                logger.error(f"Error accessing price data for {symbol} at step {self.current_step}")
+                logger.error(f"Data length: {len(self.data[symbol])}")
                 raise e
         
         state.append(self.balance / self.initial_balance)  # Normalized balance
@@ -248,7 +387,6 @@ class StockTradingEnvironment:
             try:
                 # Make sure we have enough data
                 if self.current_step < self.lookback_window:
-                    print(f"Warning: Not enough history for {symbol}. Using available data.")
                     available_data = self.data[symbol]['Close'].iloc[:self.current_step].values
                     # Pad with the earliest available price if needed
                     if len(available_data) > 0:
@@ -275,7 +413,7 @@ class StockTradingEnvironment:
                     else:
                         state.append(float(price))
             except Exception as e:
-                print(f"Error processing price history for {symbol}: {e}")
+                logger.error(f"Error processing price history for {symbol}: {e}")
                 # Add placeholder data to maintain state vector size
                 state.extend([0.0] * self.lookback_window)
         
@@ -289,7 +427,7 @@ class StockTradingEnvironment:
                 else:
                     state[i] = 0.0  # Default for empty containers
         
-        return np.array(state)
+        return np.array(state, dtype=np.float32)  # Force float32 for TensorFlow efficiency
     
     def _calculate_portfolio_value(self):
         """Calculate current portfolio value"""
@@ -315,7 +453,6 @@ class StockTradingEnvironment:
             # Each stock has 3 action dimensions: buy, hold, sell
             buy_signal = max(0, action[action_idx])
             sell_signal = max(0, -action[action_idx + 1])
-            # hold_signal = action[action_idx + 2]  # Unused - for future extensions
             
             current_price = self.data[symbol]['Close'].iloc[self.current_step]
             # Convert to scalar if it's a Series
@@ -389,13 +526,13 @@ class AlpacaTradingSystem:
                     current_price = barset[-1].c
                 else:
                     # Fallback if no data is available
-                    print(f"No recent price data for {symbol}, using default price")
+                    logger.warning(f"No recent price data for {symbol}, using default price")
                     current_price = 100.0
                 
                 state.append(current_price / 1000.0)  # Normalize price
                 state.append(positions[symbol] / 100.0)  # Normalize position
             except Exception as e:
-                print(f"Error getting price data for {symbol}: {e}")
+                logger.error(f"Error getting price data for {symbol}: {e}")
                 # Use default values
                 state.append(100.0 / 1000.0)  # Default normalized price
                 state.append(positions[symbol] / 100.0)  # Normalize position
@@ -410,7 +547,7 @@ class AlpacaTradingSystem:
                     prices = [bar.c for bar in bars[-LOOKBACK_WINDOW:]]
                 else:
                     # Pad with the earliest available price if needed
-                    print(f"Warning: Not enough history for {symbol}. Using available data.")
+                    logger.warning(f"Not enough history for {symbol}. Using available data.")
                     available_prices = [bar.c for bar in bars]
                     if len(available_prices) > 0:
                         padding = [available_prices[0]] * (LOOKBACK_WINDOW - len(available_prices))
@@ -423,11 +560,11 @@ class AlpacaTradingSystem:
                 normalized_prices = [p / price_max for p in prices]
                 state.extend(normalized_prices)
             except Exception as e:
-                print(f"Error processing price history for {symbol}: {e}")
+                logger.error(f"Error processing price history for {symbol}: {e}")
                 # Add placeholder data to maintain state vector size
                 state.extend([0.0] * LOOKBACK_WINDOW)
         
-        return np.array(state)
+        return np.array(state, dtype=np.float32)
     
     def execute_trades(self):
         """Execute trades based on agent's decisions"""
@@ -464,9 +601,9 @@ class AlpacaTradingSystem:
                         type='market',
                         time_in_force='day'
                     )
-                    print(f"BUY ORDER: {shares_to_buy} shares of {symbol}")
+                    logger.info(f"BUY ORDER: {shares_to_buy} shares of {symbol}")
                 except Exception as e:
-                    print(f"Buy order failed for {symbol}: {e}")
+                    logger.error(f"Buy order failed for {symbol}: {e}")
             
             # Execute sell order
             if shares_to_sell > 0:
@@ -478,35 +615,57 @@ class AlpacaTradingSystem:
                         type='market',
                         time_in_force='day'
                     )
-                    print(f"SELL ORDER: {shares_to_sell} shares of {symbol}")
+                    logger.info(f"SELL ORDER: {shares_to_sell} shares of {symbol}")
                 except Exception as e:
-                    print(f"Sell order failed for {symbol}: {e}")
+                    logger.error(f"Sell order failed for {symbol}: {e}")
         
         return actions
 
 def train_agent():
-    """Train the DRL agent using historical data"""
+    """Train the DRL agent using historical data with GPU acceleration"""
     env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
     agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
     
     best_reward = -np.inf
+    checkpoint_interval = 50  # Save every 50 episodes
     
-    for episode in range(TRAINING_EPISODES):
+    # Create a progress bar for training
+    progress_bar = tqdm(range(TRAINING_EPISODES), desc="Training Progress")
+    
+    for episode in progress_bar:
         state = env.reset()
         total_reward = 0
         done = False
+        episode_losses = []
         
+        # Use mini-batch updates for faster training
         while not done:
             action = agent.act(state)
             next_state, reward, done, info = env.step(action)
             
             agent.remember(state, action, reward, next_state, done)
-            agent.train()
+            losses = agent.train()
+            
+            if losses:
+                episode_losses.append(losses)
             
             state = next_state
             total_reward += reward
         
-        print(f"Episode: {episode+1}/{TRAINING_EPISODES}, Total Reward: {total_reward}, Final Portfolio Value: {info['portfolio_value']}")
+        # Calculate mean losses for this episode
+        if episode_losses:
+            mean_actor_loss = np.mean([loss['actor_loss'] for loss in episode_losses if 'actor_loss' in loss])
+            mean_critic_loss = np.mean([loss['critic_loss'] for loss in episode_losses if 'critic_loss' in loss])
+            progress_bar.set_postfix({
+                'reward': total_reward, 
+                'value': info['portfolio_value'],
+                'actor_loss': mean_actor_loss,
+                'critic_loss': mean_critic_loss
+            })
+        
+        # Save checkpoint periodically
+        if episode % checkpoint_interval == 0:
+            agent.save_models()
         
         # Save best model
         if total_reward > best_reward:
@@ -529,7 +688,7 @@ def test_agent(agent=None):
     total_rewards = []
     portfolio_values = []
     
-    for episode in range(TEST_EPISODES):
+    for episode in tqdm(range(TEST_EPISODES), desc="Testing Progress"):
         state = env.reset()
         total_reward = 0
         done = False
@@ -546,19 +705,55 @@ def test_agent(agent=None):
         total_rewards.append(total_reward)
         portfolio_values.append(episode_portfolio)
         
-        print(f"Test Episode {episode+1}/{TEST_EPISODES}, Final Reward: {total_reward}, Final Portfolio Value: {info['portfolio_value']}")
+        if episode % 10 == 0:  # Print only every 10 episodes to reduce output
+            logger.info(f"Test Episode {episode+1}/{TEST_EPISODES}, Final Reward: {total_reward:.4f}, Final Portfolio Value: {info['portfolio_value']:.2f}")
+    
+# Calculate statistics
+    final_values = [portfolio[-1] for portfolio in portfolio_values]
+    mean_final_value = np.mean(final_values)
+    std_final_value = np.std(final_values)
+    
+    logger.info(f"Testing completed. Mean final portfolio value: ${mean_final_value:.2f} ± ${std_final_value:.2f}")
     
     # Plot results
-    plt.figure(figsize=(12, 6))
-    for i, portfolio in enumerate(portfolio_values):
-        plt.plot(portfolio, label=f"Episode {i+1}")
+    plt.figure(figsize=(12, 8))
+    
+    # Plot average portfolio value
+    avg_portfolio = np.mean([np.array(p[:min(len(p) for p in portfolio_values)]) for p in portfolio_values], axis=0)
+    plt.plot(avg_portfolio, 'b-', linewidth=2, label='Average Portfolio Value')
+    
+    # Plot confidence interval
+    if len(portfolio_values) > 1:
+        std_portfolio = np.std([np.array(p[:min(len(p) for p in portfolio_values)]) for p in portfolio_values], axis=0)
+        plt.fill_between(range(len(avg_portfolio)), 
+                         avg_portfolio - std_portfolio, 
+                         avg_portfolio + std_portfolio, 
+                         color='blue', alpha=0.2, label='Standard Deviation')
+    
+    # Plot some individual episodes
+    num_episodes_to_plot = min(5, len(portfolio_values))
+    for i in range(num_episodes_to_plot):
+        plt.plot(portfolio_values[i], 'r-', alpha=0.3)
     
     plt.title("Portfolio Value During Testing Episodes")
     plt.xlabel("Trading Steps")
     plt.ylabel("Portfolio Value ($)")
     plt.legend()
-    plt.savefig("test_results.png")
-    plt.show()
+    plt.grid(True)
+    plt.savefig("test_results.png", dpi=300)
+    plt.close()
+    
+    # Plot the distribution of final values
+    plt.figure(figsize=(10, 6))
+    plt.hist(final_values, bins=20, alpha=0.7, color='green')
+    plt.axvline(mean_final_value, color='r', linestyle='dashed', linewidth=2, label=f'Mean: ${mean_final_value:.2f}')
+    plt.title("Distribution of Final Portfolio Values")
+    plt.xlabel("Final Portfolio Value ($)")
+    plt.ylabel("Frequency")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("final_values_distribution.png", dpi=300)
+    plt.close()
     
     return agent
 
@@ -566,7 +761,9 @@ def run_live_trading():
     """Run the agent in live trading mode with Alpaca"""
     # Load trained agent
     agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
-    agent.load_models("./models")
+    if not agent.load_models("./models"):
+        logger.error("Failed to load model weights. Please train the model first.")
+        return
     
     # Create trading system
     trading_system = AlpacaTradingSystem(agent, STOCK_SYMBOLS)
@@ -574,55 +771,337 @@ def run_live_trading():
     # Check market status
     clock = api.get_clock()
     
-    print("Starting live trading system...")
-    print(f"Current Time: {clock.timestamp}")
-    print(f"Market Open: {clock.is_open}")
+    logger.info("Starting live trading system...")
+    logger.info(f"Current Time: {clock.timestamp}")
+    logger.info(f"Market Open: {clock.is_open}")
     
     if not clock.is_open:
         next_open = api.get_calendar(start=datetime.now().date().isoformat())[0].open
-        print(f"Market is closed. Next opening at {next_open}")
+        logger.info(f"Market is closed. Next opening at {next_open}")
     
     # Main trading loop
-    while True:
-        clock = api.get_clock()
-        if clock.is_open:
-            print("\n--- Executing Trades ---")
-            actions = trading_system.execute_trades()
-            print(f"Actions taken: {actions}")
-            
-            # Get current portfolio value
-            account = api.get_account()
-            equity = float(account.equity)
-            print(f"Current Portfolio Value: ${equity}")
-            
-            # Sleep until next trading decision
-            if TRADING_FREQUENCY == "daily":
-                # Check time to market close
-                time_to_close = (clock.next_close - clock.timestamp).total_seconds()
-                if time_to_close < 60*60:  # If less than 1 hour to close
-                    print(f"Market closing soon. Sleeping until next market open.")
-                    time.sleep(time_to_close + 60*60)  # Sleep until next day
+    try:
+        while True:
+            clock = api.get_clock()
+            if clock.is_open:
+                logger.info("\n--- Executing Trades ---")
+                actions = trading_system.execute_trades()
+                
+                # Log the actions in a more readable format
+                action_summary = []
+                for i, symbol in enumerate(STOCK_SYMBOLS):
+                    action_idx = i * 3
+                    buy_signal = max(0, actions[action_idx])
+                    sell_signal = max(0, -actions[action_idx + 1])
+                    if buy_signal > 0.1:
+                        action_summary.append(f"BUY {symbol}: {buy_signal:.2f}")
+                    elif sell_signal > 0.1:
+                        action_summary.append(f"SELL {symbol}: {sell_signal:.2f}")
+                
+                if action_summary:
+                    logger.info(f"Actions taken: {', '.join(action_summary)}")
                 else:
-                    print("Waiting for next trading window...")
-                    time.sleep(60*60)  # Check every hour
-            elif TRADING_FREQUENCY == "hourly":
-                print("Waiting for next hourly window...")
-                time.sleep(60*60)  # Sleep for 1 hour
-            else:  # "minute"
-                print("Waiting for next minute window...")
-                time.sleep(60)  # Sleep for 1 minute
-        else:
-            print("Market is closed. Waiting for market to open...")
-            time.sleep(60*60)  # Check every hour if market opened
+                    logger.info("No significant trading actions taken")
+                
+                # Get current portfolio value
+                account = api.get_account()
+                equity = float(account.equity)
+                logger.info(f"Current Portfolio Value: ${equity:.2f}")
+                
+                # Sleep until next trading decision
+                if TRADING_FREQUENCY == "daily":
+                    # Check time to market close
+                    time_to_close = (clock.next_close - clock.timestamp).total_seconds()
+                    if time_to_close < 60*60:  # If less than 1 hour to close
+                        logger.info(f"Market closing soon. Sleeping until next market open.")
+                        time.sleep(time_to_close + 60*60)  # Sleep until next day
+                    else:
+                        logger.info("Waiting for next trading window...")
+                        time.sleep(60*60)  # Check every hour
+                elif TRADING_FREQUENCY == "hourly":
+                    logger.info("Waiting for next hourly window...")
+                    time.sleep(60*60)  # Sleep for 1 hour
+                else:  # "minute"
+                    logger.info("Waiting for next minute window...")
+                    time.sleep(60)  # Sleep for 1 minute
+            else:
+                logger.info("Market is closed. Waiting for market to open...")
+                time.sleep(60*60)  # Check every hour if market opened
+    
+    except KeyboardInterrupt:
+        logger.info("Trading session terminated by user")
+    except Exception as e:
+        logger.error(f"Error in trading loop: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+def run_parallel_training(num_processes=None):
+    """
+    Run multiple parallel training sessions and combine the results
+    This can help utilize multi-core CPUs better when GPU is not available
+    """
+    if num_processes is None:
+        import multiprocessing
+        num_processes = max(2, multiprocessing.cpu_count() - 1)  # Leave one CPU free
+    
+    from multiprocessing import Pool
+    import random
+    
+    def train_with_seed(seed):
+        """Train with a specific random seed"""
+        np.random.seed(seed)
+        tf.random.set_seed(seed)
+        random.seed(seed)
+        
+        # Use a different output path for each process
+        model_path = f"./models/model_{seed}"
+        Path(model_path).mkdir(parents=True, exist_ok=True)
+        
+        env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
+        agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
+        
+        best_reward = -np.inf
+        
+        # Train for fewer episodes in each process
+        episodes_per_process = TRAINING_EPISODES // num_processes
+        
+        for episode in range(episodes_per_process):
+            state = env.reset()
+            total_reward = 0
+            done = False
+            
+            while not done:
+                action = agent.act(state)
+                next_state, reward, done, info = env.step(action)
+                
+                agent.remember(state, action, reward, next_state, done)
+                agent.train()
+                
+                state = next_state
+                total_reward += reward
+            
+            if episode % 10 == 0:
+                logger.info(f"Process {seed}: Episode {episode+1}/{episodes_per_process}, Reward: {total_reward:.4f}, Value: {info['portfolio_value']:.2f}")
+            
+            # Save best model
+            if total_reward > best_reward:
+                best_reward = total_reward
+                agent.save_models(model_path)
+        
+        # Test the trained agent
+        test_rewards = []
+        for _ in range(50):  # Run a small number of test episodes
+            state = env.reset()
+            total_reward = 0
+            done = False
+            
+            while not done:
+                action = agent.act(state, explore=False)
+                next_state, reward, done, info = env.step(action)
+                
+                state = next_state
+                total_reward += reward
+            
+            test_rewards.append(total_reward)
+        
+        avg_reward = np.mean(test_rewards)
+        logger.info(f"Process {seed} completed. Average test reward: {avg_reward:.4f}")
+        
+        return {
+            'seed': seed,
+            'avg_reward': avg_reward,
+            'model_path': model_path,
+            'best_reward': best_reward
+        }
+    
+    # Generate random seeds for different processes
+    seeds = [random.randint(1, 10000) for _ in range(num_processes)]
+    
+    # Run training in parallel
+    logger.info(f"Starting parallel training with {num_processes} processes...")
+    with Pool(num_processes) as pool:
+        results = pool.map(train_with_seed, seeds)
+    
+    # Find the best model based on test performance
+    best_result = max(results, key=lambda x: x['avg_reward'])
+    logger.info(f"Best model found from process with seed {best_result['seed']}")
+    logger.info(f"Best model average test reward: {best_result['avg_reward']:.4f}")
+    
+    # Copy the best model to the main models directory
+    best_model_path = best_result['model_path']
+    import shutil
+    for file in Path(best_model_path).glob('*'):
+        shutil.copy(file, "./models/")
+    
+    logger.info(f"Best model copied to main models directory")
+    
+    # Load and return the best agent
+    best_agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
+    best_agent.load_models("./models")
+    
+    return best_agent
+
+def hyperparameter_optimization(trials=10):
+    """
+    Run hyperparameter optimization to find better model parameters
+    Uses a simple random search approach
+    """
+    import random
+    from joblib import Parallel, delayed
+    
+    # Define hyperparameter search space
+    param_space = {
+        'learning_rate': [0.0001, 0.0005, 0.001, 0.005, 0.01],
+        'gamma': [0.9, 0.95, 0.98, 0.99],
+        'batch_size': [32, 64, 128, 256],
+        'epsilon_decay': [0.99, 0.995, 0.998, 0.999]
+    }
+    
+    def evaluate_hyperparams(trial_idx, lr, gamma, batch_size, epsilon_decay):
+        """Train and evaluate with specific hyperparameters"""
+        global BATCH_SIZE, GAMMA
+        
+        # Store original values
+        orig_batch_size = BATCH_SIZE
+        orig_gamma = GAMMA
+        
+        # Set new values for this trial
+        BATCH_SIZE = batch_size
+        GAMMA = gamma
+        
+        # Set random seed for reproducibility
+        random_seed = trial_idx * 1000
+        np.random.seed(random_seed)
+        tf.random.set_seed(random_seed)
+        random.seed(random_seed)
+        
+        # Create model path for this trial
+        model_path = f"./models/trial_{trial_idx}"
+        Path(model_path).mkdir(parents=True, exist_ok=True)
+        
+        # Initialize environment and agent
+        env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
+        agent = DRLAgent(STATE_DIM, ACTION_DIM, learning_rate=lr)
+        agent.epsilon_decay = epsilon_decay
+        
+        # Train for fewer episodes to speed up optimization
+        train_episodes = 200
+        
+        # Train the agent
+        best_reward = -np.inf
+        for episode in range(train_episodes):
+            state = env.reset()
+            total_reward = 0
+            done = False
+            
+            while not done:
+                action = agent.act(state)
+                next_state, reward, done, info = env.step(action)
+                
+                agent.remember(state, action, reward, next_state, done)
+                agent.train()
+                
+                state = next_state
+                total_reward += reward
+            
+            if episode % 50 == 0:
+                logger.info(f"Trial {trial_idx}, Episode {episode+1}/{train_episodes}, Reward: {total_reward:.4f}")
+            
+            # Save best model for this trial
+            if total_reward > best_reward:
+                best_reward = total_reward
+                agent.save_models(model_path)
+        
+        # Evaluate the trained agent
+        test_episodes = 50
+        test_rewards = []
+        
+        for _ in range(test_episodes):
+            state = env.reset()
+            total_reward = 0
+            done = False
+            
+            while not done:
+                action = agent.act(state, explore=False)
+                next_state, reward, done, info = env.step(action)
+                
+                state = next_state
+                total_reward += reward
+            
+            test_rewards.append(total_reward)
+        
+        avg_test_reward = np.mean(test_rewards)
+        std_test_reward = np.std(test_rewards)
+        
+        # Restore original values
+        BATCH_SIZE = orig_batch_size
+        GAMMA = orig_gamma
+        
+        logger.info(f"Trial {trial_idx} completed. Hyperparameters: lr={lr}, gamma={gamma}, "
+                   f"batch_size={batch_size}, epsilon_decay={epsilon_decay}")
+        logger.info(f"Average test reward: {avg_test_reward:.4f} ± {std_test_reward:.4f}")
+        
+        return {
+            'trial_idx': trial_idx,
+            'learning_rate': lr,
+            'gamma': gamma,
+            'batch_size': batch_size,
+            'epsilon_decay': epsilon_decay,
+            'avg_test_reward': avg_test_reward,
+            'std_test_reward': std_test_reward,
+            'model_path': model_path
+        }
+    
+    # Generate random hyperparameter combinations
+    param_combinations = []
+    for i in range(trials):
+        params = {
+            'trial_idx': i,
+            'lr': random.choice(param_space['learning_rate']),
+            'gamma': random.choice(param_space['gamma']),
+            'batch_size': random.choice(param_space['batch_size']),
+            'epsilon_decay': random.choice(param_space['epsilon_decay'])
+        }
+        param_combinations.append(params)
+    
+    # Run trials in parallel (adjust n_jobs based on available cores)
+    logger.info(f"Starting hyperparameter optimization with {trials} trials...")
+    results = Parallel(n_jobs=3)(
+        delayed(evaluate_hyperparams)(
+            p['trial_idx'], p['lr'], p['gamma'], p['batch_size'], p['epsilon_decay']
+        ) for p in param_combinations
+    )
+    
+    # Find best hyperparameters
+    best_trial = max(results, key=lambda x: x['avg_test_reward'])
+    
+    logger.info("\n--- Hyperparameter Optimization Results ---")
+    logger.info(f"Best parameters: learning_rate={best_trial['learning_rate']}, "
+               f"gamma={best_trial['gamma']}, batch_size={best_trial['batch_size']}, "
+               f"epsilon_decay={best_trial['epsilon_decay']}")
+    logger.info(f"Best average test reward: {best_trial['avg_test_reward']:.4f} ± {best_trial['std_test_reward']:.4f}")
+    
+    # Copy the best model to the main models directory
+    best_model_path = best_trial['model_path']
+    import shutil
+    for file in Path(best_model_path).glob('*'):
+        shutil.copy(file, "./models/")
+    
+    logger.info(f"Best model copied to main models directory")
+    
+    return best_trial
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Stock Trading AI with Alpaca API')
-    parser.add_argument('--mode', type=str, choices=['train', 'test', 'live'], default='train',
-                        help='Operation mode: train, test, or live trading')
+    parser = argparse.ArgumentParser(description='Stock Trading AI with Alpaca API - Optimized Version')
+    parser.add_argument('--mode', type=str, choices=['train', 'test', 'live', 'parallel', 'optimize'], default='train',
+                        help='Operation mode: train, test, live trading, parallel training, or hyperparameter optimization')
     parser.add_argument('--api_key', type=str, help='Alpaca API Key')
     parser.add_argument('--api_secret', type=str, help='Alpaca API Secret Key')
+    parser.add_argument('--processes', type=int, default=None, help='Number of parallel processes for training')
+    parser.add_argument('--trials', type=int, default=10, help='Number of trials for hyperparameter optimization')
+    parser.add_argument('--gpu', action='store_true', help='Force GPU usage (will raise error if not available)')
     
     args = parser.parse_args()
     
@@ -631,17 +1110,36 @@ if __name__ == "__main__":
         ALPACA_API_KEY = args.api_key
         ALPACA_SECRET_KEY = args.api_secret
     
+    # Check GPU availability if requested
+    if args.gpu:
+        if not tf.config.list_physical_devices('GPU'):
+            raise RuntimeError("GPU was explicitly requested but none is available. Please check your installation.")
+        else:
+            logger.info("GPU usage explicitly requested and GPU is available.")
+    
     # Create models directory if it doesn't exist
-    if not os.path.exists("./models"):
-        os.makedirs("./models")
+    Path("./models").mkdir(exist_ok=True)
     
     # Run in the specified mode
-    if args.mode == 'train':
-        print("Training agent...")
-        agent = train_agent()
-    elif args.mode == 'test':
-        print("Testing agent...")
-        test_agent()
-    elif args.mode == 'live':
-        print("Starting live trading...")
-        run_live_trading()
+    try:
+        if args.mode == 'train':
+            logger.info("Training agent...")
+            agent = train_agent()
+        elif args.mode == 'test':
+            logger.info("Testing agent...")
+            test_agent()
+        elif args.mode == 'live':
+            logger.info("Starting live trading...")
+            run_live_trading()
+        elif args.mode == 'parallel':
+            logger.info(f"Starting parallel training with {args.processes} processes...")
+            run_parallel_training(args.processes)
+        elif args.mode == 'optimize':
+            logger.info(f"Starting hyperparameter optimization with {args.trials} trials...")
+            hyperparameter_optimization(args.trials)
+    except KeyboardInterrupt:
+        logger.info("Operation interrupted by user.")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())

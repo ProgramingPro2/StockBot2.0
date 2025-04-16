@@ -175,3 +175,5 @@ cython_debug/
 
 # Training results
 models/
+checkpoints/
+data_cache/
