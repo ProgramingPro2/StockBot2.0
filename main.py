@@ -1299,6 +1299,7 @@ if __name__ == "__main__":
     parser.add_argument('--api_secret', type=str, help='Alpaca API Secret Key')
     parser.add_argument('--processes', type=int, default=None, help='Number of parallel processes for training')
     parser.add_argument('--trials', type=int, default=10, help='Number of trials for hyperparameter optimization')
+    parser.add_argument('--epochs', type=int, default=TRAINING_EPISODES, help='Number of epochs for training')
     parser.add_argument('--gpu', action='store_true', help='Force GPU usage (will raise error if not available)')
     
     args = parser.parse_args()
@@ -1322,6 +1323,8 @@ if __name__ == "__main__":
     try:
         if args.mode == 'train':
             logger.info("Training agent...")
+            logger.info(f"Number of epochs: {args.epochs}")
+            TRAINING_EPISODES = args.epochs
             agent = train_agent()
         elif args.mode == 'test':
             logger.info("Testing agent...")
