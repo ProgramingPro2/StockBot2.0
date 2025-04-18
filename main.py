@@ -17,7 +17,7 @@ import logging
 from tqdm import tqdm
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filemode='w', filename='app.log')
 logger = logging.getLogger(__name__)
 
 # Configure GPU memory growth to avoid memory allocation issues
@@ -618,7 +618,30 @@ class AlpacaTradingSystem:
                 
                 # Normalize prices
                 price_max = max(prices) if max(prices) > 0 else 1.0
-                normalized_prices = [float(p) / price_max for p in prices]
+                normalized_prices = []
+                for p in prices:
+                    # Ensure p is a scalar
+                    if hasattr(p, 'shape') and len(p.shape) > 0:
+                        p_scalar = p.item() if p.size == 1 else p[0]
+                    elif isinstance(p, (list, tuple)) and len(p) > 0:
+                        p_scalar = p[0]
+                    else:
+                        p_scalar = p
+                    normalized_prices.append(float(p_scalar) / price_max)
+                
+                if hasattr(prices, 'shape') and len(prices.shape) > 1:
+                    prices = np.ravel(prices)
+                    
+                # Ensure price_max is a scalar
+                price_max = float(np.max(prices)) if prices.size > 0 else 1.0
+                
+                # Process each price safely
+                normalized_prices = []
+                for p in prices:
+                    if hasattr(p, 'item'):
+                        p = p.item()
+                    normalized_prices.append(float(p) / price_max)
+                    
                 state.extend(normalized_prices)
                 
             except Exception as e:
