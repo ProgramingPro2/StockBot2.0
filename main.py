@@ -947,6 +947,7 @@ def invalidate_cache(symbols=None, days=1):
     
 def run_live_trading():
     """Run the agent in live trading mode with Alpaca"""
+    logger.info("Starting live trading...")
     # Load trained agent
     agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
     if not agent.load_models("./models"):
@@ -1010,6 +1011,14 @@ def run_live_trading():
                         elif sell_signal > 0.1:
                             action_summary.append(f"SELL {symbol}: {sell_signal:.2f}")
                     
+                    # Log all weights
+                    logger.info("\n--- Model Weights ---")
+                    for i, symbol in enumerate(STOCK_SYMBOLS):
+                        action_idx = i * 3
+                        buy_weight = actions[action_idx]
+                        sell_weight = actions[action_idx + 1]
+                        logger.info(f"{symbol}: Buy Weight: {buy_weight:.2f}, Sell Weight: {sell_weight:.2f}")
+
                     if action_summary:
                         logger.info(f"Actions taken: {', '.join(action_summary)}")
                     else:
@@ -1047,7 +1056,7 @@ def run_live_trading():
                         time.sleep(60)  # Sleep for 1 minute
                 else:
                     logger.info("Market is closed. Waiting for market to open...")
-                    time.sleep(60*60)  # Check every hour if market opened
+                    time.sleep(60)  # Check every hour if market opened
             except Exception as e:
                 logger.error(f"Error during trading operations: {e}")
                 # Add a delay to prevent rapid retries if there's a persistent error
