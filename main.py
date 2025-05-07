@@ -15,6 +15,7 @@ import joblib
 from pathlib import Path
 import logging
 from tqdm import tqdm
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filemode='w', filename='app.log')
@@ -55,6 +56,22 @@ TRADING_FREQUENCY = "minute"
 MAX_SHARES_PER_TRADE = 100
 TRAINING_EPISODES = 1000
 TEST_EPISODES = 1000
+
+if os.path.exists("stocks.json"):
+    with open("stocks.json", "r") as f:
+        try:
+            STOCK_SYMBOLS = json.load(f)
+            if not isinstance(STOCK_SYMBOLS, list):
+                raise ValueError("Invalid format in stocks.json. Expected a list of stock symbols.")
+            # Ensure all symbols are uppercase
+            STOCK_SYMBOLS = [symbol.upper() for symbol in STOCK_SYMBOLS]
+            # Remove duplicates
+            STOCK_SYMBOLS = list(set(STOCK_SYMBOLS))
+            # Remove empty strings
+            STOCK_SYMBOLS = [symbol for symbol in STOCK_SYMBOLS if symbol]
+            logger.info(f"Loaded stock symbols from stocks.json: {STOCK_SYMBOLS}")
+        except Exception as e:
+            logger.error(f"Error loading stock symbols from stocks.json: {e}")
 
 # Cache directory for stock data
 CACHE_DIR = Path("./data_cache")
@@ -729,7 +746,7 @@ class AlpacaTradingSystem:
                         positions[symbol]['last_trade'] = datetime.now()
                         
                 except Exception as e:
-                    logger.error(f"Buy order failed for {symbol}: {e}")
+                    logger.error(f"Buy order failed for {symbol}: {e}, for shares: {shares_to_buy} at total price: {current_price * shares_to_buy}")
             
             # Wait a few seconds between buy and sell to avoid wash trade detection
             if shares_to_buy > 0 and shares_to_sell > 0:
@@ -1065,262 +1082,6 @@ def run_live_trading():
     except KeyboardInterrupt:
         logger.info("Trading session terminated by user")
 
-def run_parallel_training(num_processes=None):
-    """
-    Run multiple parallel training sessions and combine the results
-    This can help utilize multi-core CPUs better when GPU is not available
-    """
-    if num_processes is None:
-        import multiprocessing
-        num_processes = max(2, multiprocessing.cpu_count() - 1)  # Leave one CPU free
-    
-    from multiprocessing import Pool
-    import random
-    
-    def train_with_seed(seed):
-        """Train with a specific random seed"""
-        np.random.seed(seed)
-        tf.random.set_seed(seed)
-        random.seed(seed)
-        
-        # Use a different output path for each process
-        model_path = f"./models/model_{seed}"
-        Path(model_path).mkdir(parents=True, exist_ok=True)
-        
-        env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
-        agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
-        
-        best_reward = -np.inf
-        
-        # Train for fewer episodes in each process
-        episodes_per_process = TRAINING_EPISODES // num_processes
-        
-        for episode in range(episodes_per_process):
-            state = env.reset()
-            total_reward = 0
-            done = False
-            
-            while not done:
-                action = agent.act(state)
-                next_state, reward, done, info = env.step(action)
-                
-                agent.remember(state, action, reward, next_state, done)
-                agent.train()
-                
-                state = next_state
-                total_reward += reward
-            
-            if episode % 10 == 0:
-                logger.info(f"Process {seed}: Episode {episode+1}/{episodes_per_process}, Reward: {total_reward:.4f}, Value: {info['portfolio_value']:.2f}")
-            
-            # Save best model
-            if total_reward > best_reward:
-                best_reward = total_reward
-                agent.save_models(model_path)
-        
-        # Test the trained agent
-        test_rewards = []
-        for _ in range(50):  # Run a small number of test episodes
-            state = env.reset()
-            total_reward = 0
-            done = False
-            
-            while not done:
-                action = agent.act(state, explore=False)
-                next_state, reward, done, info = env.step(action)
-                
-                state = next_state
-                total_reward += reward
-            
-            test_rewards.append(total_reward)
-        
-        avg_reward = np.mean(test_rewards)
-        logger.info(f"Process {seed} completed. Average test reward: {avg_reward:.4f}")
-        
-        return {
-            'seed': seed,
-            'avg_reward': avg_reward,
-            'model_path': model_path,
-            'best_reward': best_reward
-        }
-    
-    # Generate random seeds for different processes
-    seeds = [random.randint(1, 10000) for _ in range(num_processes)]
-    
-    # Run training in parallel
-    logger.info(f"Starting parallel training with {num_processes} processes...")
-    with Pool(num_processes) as pool:
-        results = pool.map(train_with_seed, seeds)
-    
-    # Find the best model based on test performance
-    best_result = max(results, key=lambda x: x['avg_reward'])
-    logger.info(f"Best model found from process with seed {best_result['seed']}")
-    logger.info(f"Best model average test reward: {best_result['avg_reward']:.4f}")
-    
-    # Copy the best model to the main models directory
-    best_model_path = best_result['model_path']
-    import shutil
-    for file in Path(best_model_path).glob('*'):
-        shutil.copy(file, "./models/")
-    
-    logger.info(f"Best model copied to main models directory")
-    
-    # Load and return the best agent
-    best_agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
-    best_agent.load_models("./models")
-    
-    return best_agent
-
-def hyperparameter_optimization(trials=10):
-    """
-    Run hyperparameter optimization to find better model parameters
-    Uses a simple random search approach
-    """
-    import random
-    from joblib import Parallel, delayed
-    
-    # Define hyperparameter search space
-    param_space = {
-        'learning_rate': [0.0001, 0.0005, 0.001, 0.005, 0.01],
-        'gamma': [0.9, 0.95, 0.98, 0.99],
-        'batch_size': [32, 64, 128, 256],
-        'epsilon_decay': [0.99, 0.995, 0.998, 0.999]
-    }
-    
-    def evaluate_hyperparams(trial_idx, lr, gamma, batch_size, epsilon_decay):
-        """Train and evaluate with specific hyperparameters"""
-        global BATCH_SIZE, GAMMA
-        
-        # Store original values
-        orig_batch_size = BATCH_SIZE
-        orig_gamma = GAMMA
-        
-        # Set new values for this trial
-        BATCH_SIZE = batch_size
-        GAMMA = gamma
-        
-        # Set random seed for reproducibility
-        random_seed = trial_idx * 1000
-        np.random.seed(random_seed)
-        tf.random.set_seed(random_seed)
-        random.seed(random_seed)
-        
-        # Create model path for this trial
-        model_path = f"./models/trial_{trial_idx}"
-        Path(model_path).mkdir(parents=True, exist_ok=True)
-        
-        # Initialize environment and agent
-        env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
-        agent = DRLAgent(STATE_DIM, ACTION_DIM, learning_rate=lr)
-        agent.epsilon_decay = epsilon_decay
-        
-        # Train for fewer episodes to speed up optimization
-        train_episodes = 200
-        
-        # Train the agent
-        best_reward = -np.inf
-        for episode in range(train_episodes):
-            state = env.reset()
-            total_reward = 0
-            done = False
-            
-            while not done:
-                action = agent.act(state)
-                next_state, reward, done, info = env.step(action)
-                
-                agent.remember(state, action, reward, next_state, done)
-                agent.train()
-                
-                state = next_state
-                total_reward += reward
-            
-            if episode % 50 == 0:
-                logger.info(f"Trial {trial_idx}, Episode {episode+1}/{train_episodes}, Reward: {total_reward:.4f}")
-            
-            # Save best model for this trial
-            if total_reward > best_reward:
-                best_reward = total_reward
-                agent.save_models(model_path)
-        
-        # Evaluate the trained agent
-        test_episodes = 50
-        test_rewards = []
-        
-        for _ in range(test_episodes):
-            state = env.reset()
-            total_reward = 0
-            done = False
-            
-            while not done:
-                action = agent.act(state, explore=False)
-                next_state, reward, done, info = env.step(action)
-                
-                state = next_state
-                total_reward += reward
-            
-            test_rewards.append(total_reward)
-        
-        avg_test_reward = np.mean(test_rewards)
-        std_test_reward = np.std(test_rewards)
-        
-        # Restore original values
-        BATCH_SIZE = orig_batch_size
-        GAMMA = orig_gamma
-        
-        logger.info(f"Trial {trial_idx} completed. Hyperparameters: lr={lr}, gamma={gamma}, "
-                   f"batch_size={batch_size}, epsilon_decay={epsilon_decay}")
-        logger.info(f"Average test reward: {avg_test_reward:.4f} ± {std_test_reward:.4f}")
-        
-        return {
-            'trial_idx': trial_idx,
-            'learning_rate': lr,
-            'gamma': gamma,
-            'batch_size': batch_size,
-            'epsilon_decay': epsilon_decay,
-            'avg_test_reward': avg_test_reward,
-            'std_test_reward': std_test_reward,
-            'model_path': model_path
-        }
-    
-    # Generate random hyperparameter combinations
-    param_combinations = []
-    for i in range(trials):
-        params = {
-            'trial_idx': i,
-            'lr': random.choice(param_space['learning_rate']),
-            'gamma': random.choice(param_space['gamma']),
-            'batch_size': random.choice(param_space['batch_size']),
-            'epsilon_decay': random.choice(param_space['epsilon_decay'])
-        }
-        param_combinations.append(params)
-    
-    # Run trials in parallel (adjust n_jobs based on available cores)
-    logger.info(f"Starting hyperparameter optimization with {trials} trials...")
-    results = Parallel(n_jobs=3)(
-        delayed(evaluate_hyperparams)(
-            p['trial_idx'], p['lr'], p['gamma'], p['batch_size'], p['epsilon_decay']
-        ) for p in param_combinations
-    )
-    
-    # Find best hyperparameters
-    best_trial = max(results, key=lambda x: x['avg_test_reward'])
-    
-    logger.info("\n--- Hyperparameter Optimization Results ---")
-    logger.info(f"Best parameters: learning_rate={best_trial['learning_rate']}, "
-               f"gamma={best_trial['gamma']}, batch_size={best_trial['batch_size']}, "
-               f"epsilon_decay={best_trial['epsilon_decay']}")
-    logger.info(f"Best average test reward: {best_trial['avg_test_reward']:.4f} ± {best_trial['std_test_reward']:.4f}")
-    
-    # Copy the best model to the main models directory
-    best_model_path = best_trial['model_path']
-    import shutil
-    for file in Path(best_model_path).glob('*'):
-        shutil.copy(file, "./models/")
-    
-    logger.info(f"Best model copied to main models directory")
-    
-    return best_trial
-
 if __name__ == "__main__":
     import argparse
     
@@ -1329,8 +1090,6 @@ if __name__ == "__main__":
                         help='Operation mode: train, test, live trading, parallel training, or hyperparameter optimization')
     parser.add_argument('--api_key', type=str, help='Alpaca API Key')
     parser.add_argument('--api_secret', type=str, help='Alpaca API Secret Key')
-    parser.add_argument('--processes', type=int, default=None, help='Number of parallel processes for training')
-    parser.add_argument('--trials', type=int, default=10, help='Number of trials for hyperparameter optimization')
     parser.add_argument('--epochs', type=int, default=TRAINING_EPISODES, help='Number of epochs for training')
     parser.add_argument('--gpu', action='store_true', help='Force GPU usage (will raise error if not available)')
     
@@ -1364,12 +1123,6 @@ if __name__ == "__main__":
         elif args.mode == 'live':
             logger.info("Starting live trading...")
             run_live_trading()
-        elif args.mode == 'parallel':
-            logger.info(f"Starting parallel training with {args.processes} processes...")
-            run_parallel_training(args.processes)
-        elif args.mode == 'optimize':
-            logger.info(f"Starting hyperparameter optimization with {args.trials} trials...")
-            hyperparameter_optimization(args.trials)
     except KeyboardInterrupt:
         logger.info("Operation interrupted by user.")
     except Exception as e:
