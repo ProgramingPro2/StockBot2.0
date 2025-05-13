@@ -6,7 +6,7 @@ import alpaca_trade_api as tradeapi
 from datetime import datetime, timedelta
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, Model, load_model
-from tensorflow.keras.layers import Input, Dense, LSTM, Flatten, concatenate
+from tensorflow.keras.layers import Input, Dense, LSTM, Flatten, concatenate, BatchNormalization
 from tensorflow.keras import optimizers
 import matplotlib.pyplot as plt
 import yfinance as yf
@@ -25,10 +25,21 @@ logger = logging.getLogger(__name__)
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
     try:
-        # Currently, memory growth needs to be the same across GPUs
+        # Set memory growth and optimize for RTX 3090
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-        logger.info(f"GPU is available. Found {len(gpus)} GPU(s)")
+        
+        # Set GPU memory limit to leave some for the system (20GB out of 24GB)
+        tf.config.experimental.set_virtual_device_configuration(
+            gpus[0],
+            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=20000)]
+        )
+        
+        # Enable mixed precision training for faster performance
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        
+        logger.info(f"GPU is available. Found {len(gpus)} GPU(s). Mixed precision policy set to {policy.name}")
     except RuntimeError as e:
         logger.warning(f"Memory growth setting failed: {e}")
 else:
@@ -36,6 +47,10 @@ else:
 
 # Enable eager execution
 tf.config.run_functions_eagerly(True)
+
+tf.config.optimizer.set_jit(True)  # Enable XLA JIT compilation
+tf.config.threading.set_inter_op_parallelism_threads(8)   # Number of P-cores
+tf.config.threading.set_intra_op_parallelism_threads(8)   # Number of P-cores
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -82,51 +97,111 @@ STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW
 ACTION_DIM = len(STOCK_SYMBOLS) * 3
 LEARNING_RATE = 0.001
 GAMMA = 0.95
-BATCH_SIZE = 128  # Increased batch size for better GPU utilization
-MEMORY_SIZE = 100000  # Increased memory size for better experience diversity
+BATCH_SIZE = 4096  # For max GPU utilization on RTX 3090 (with mixed precision)
+MEMORY_SIZE = 200000  # Increased for better training stability
 
 class ReplayBuffer:
-    def __init__(self, capacity):
+    def __init__(self, capacity, state_dim, action_dim):
         self.capacity = capacity
-        self.buffer = []
         self.position = 0
+        self.size = 0
+        
+        # Pre-allocate memory for better performance
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)
     
     def push(self, state, action, reward, next_state, done):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = (state, action, reward, next_state, done)
+        # Direct assignment to pre-allocated arrays
+        self.states[self.position] = state
+        self.actions[self.position] = action
+        self.rewards[self.position] = reward
+        self.next_states[self.position] = next_state
+        self.dones[self.position] = float(done)
+        
+        # Update position and size
         self.position = (self.position + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
     
     def sample(self, batch_size):
-        batch = np.random.choice(len(self.buffer), batch_size, replace=False)
-        states, actions, rewards, next_states, dones = zip(*[self.buffer[i] for i in batch])
-        return np.array(states), np.array(actions), np.array(rewards), np.array(next_states), np.array(dones)
+        # Generate random indices - much faster than random.choice
+        indices = np.random.randint(0, self.size, batch_size)
+        
+        # Return slices of the arrays for better performance
+        return (
+            self.states[indices],
+            self.actions[indices],
+            self.rewards[indices],
+            self.next_states[indices],
+            self.dones[indices]
+        )
     
     def __len__(self):
-        return len(self.buffer)
+        return self.size
     
     def save(self, path):
         """Save replay buffer to disk"""
-        joblib.dump(self.buffer, path)
+        buffer_data = {
+            "states": self.states[:self.size],
+            "actions": self.actions[:self.size],
+            "rewards": self.rewards[:self.size],
+            "next_states": self.next_states[:self.size],
+            "dones": self.dones[:self.size],
+            "position": self.position,
+            "size": self.size
+        }
+        np.savez_compressed(path, **buffer_data)
     
     def load(self, path):
         """Load replay buffer from disk"""
-        if os.path.exists(path):
-            self.buffer = joblib.load(path)
-            self.position = len(self.buffer) % self.capacity
-            return True
-        return False
+        if os.path.exists(path): # Check existence here too
+            try:
+                data = np.load(path, allow_pickle=True) # allow_pickle might not be needed if only numpy arrays
+
+                # Copy data to buffer arrays
+                size = min(int(data["size"]), self.capacity) # Ensure size is int and capped
+                if size > 0: # Only load if there's data
+                    self.states[:size] = data["states"][:size]
+                    self.actions[:size] = data["actions"][:size]
+                    self.rewards[:size] = data["rewards"][:size]
+                    self.next_states[:size] = data["next_states"][:size]
+                    self.dones[:size] = data["dones"][:size]
+
+                    self.position = int(data["position"]) % self.capacity
+                    self.size = size
+                    logger.info(f"Replay buffer loaded {self.size} transitions from {path}") # Added log
+                    return True
+                else:
+                    logger.warning(f"Replay buffer file {path} was empty or had size 0.")
+                    return False
+            except Exception as e:
+                logger.error(f"Error loading replay buffer from {path}: {e}")
+                # Optionally, reset the buffer state here if loading fails partially
+                self.position = 0
+                self.size = 0
+                return False
+        else:
+            # logger.info(f"Replay buffer file not found: {path}") # Optional: log if file not found
+            return False
 
 class DRLAgent:
     def __init__(self, state_dim, action_dim, learning_rate=0.001):
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.memory = ReplayBuffer(MEMORY_SIZE)
+        
+        # Use the optimized replay buffer
+        self.memory = ReplayBuffer(MEMORY_SIZE, state_dim, action_dim)
+        
         self.gamma = GAMMA
         self.epsilon = 1.0
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
         self.learning_rate = learning_rate
+        
+        # Set default TensorFlow dtype to float32 explicitly
+        tf.keras.backend.set_floatx('float32')
         
         # Create separate optimizers for actor and critic
         self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
@@ -135,6 +210,14 @@ class DRLAgent:
         # Build models
         self.actor = self._build_actor()
         self.critic = self._build_critic()
+        
+        # Create target networks for more stable learning
+        self.target_actor = self._build_actor()
+        self.target_critic = self._build_critic()
+        
+        # Initialize target networks with same weights
+        self.target_actor.set_weights(self.actor.get_weights())
+        self.target_critic.set_weights(self.critic.get_weights())
         
         # TensorFlow checkpoint for saving models
         self.checkpoint_dir = "./checkpoints"
@@ -149,30 +232,41 @@ class DRLAgent:
         )
         
     def _build_actor(self):
-        """Build policy network (actor) that selects actions"""
+        """Build policy network (actor) that selects actions with GPU optimizations"""
         model = Sequential([
-            Dense(128, input_shape=(self.state_dim,), activation='relu'),
-            Dense(128, activation='relu'),
-            Dense(64, activation='relu'),
-            Dense(self.action_dim, activation='tanh')
+            # Use CuDNN-optimized layers when running on GPU
+            Dense(512, input_shape=(self.state_dim,), activation='relu', 
+                kernel_initializer=tf.keras.initializers.HeNormal(), dtype='float32'),
+            BatchNormalization(dtype='float32'),
+            Dense(256, activation='relu', kernel_initializer=tf.keras.initializers.HeNormal(), dtype='float32'),
+            BatchNormalization(dtype='float32'),
+            Dense(128, activation='relu', kernel_initializer=tf.keras.initializers.HeNormal(), dtype='float32'),
+            Dense(self.action_dim, activation='tanh', kernel_initializer=tf.keras.initializers.GlorotNormal(), dtype='float32')
         ])
         model.compile(loss='mse', optimizer=self.actor_optimizer)
         return model
 
     def _build_critic(self):
-        """Build value network (critic) that estimates Q-values"""
-        state_input = Input(shape=(self.state_dim,))
-        action_input = Input(shape=(self.action_dim,))
+        """Build value network (critic) that estimates Q-values with GPU optimizations"""
+        state_input = Input(shape=(self.state_dim,), dtype='float32')
+        action_input = Input(shape=(self.action_dim,), dtype='float32')
         
-        state_h1 = Dense(128, activation='relu')(state_input)
-        state_h2 = Dense(64, activation='relu')(state_h1)
+        # State branch with batch normalization
+        state_h1 = Dense(512, activation='relu', kernel_initializer=tf.keras.initializers.HeNormal(), dtype='float32')(state_input)
+        state_bn1 = BatchNormalization(dtype='float32')(state_h1)
+        state_h2 = Dense(256, activation='relu', kernel_initializer=tf.keras.initializers.HeNormal(), dtype='float32')(state_bn1)
+        state_bn2 = BatchNormalization(dtype='float32')(state_h2)
         
-        action_h1 = Dense(64, activation='relu')(action_input)
+        # Action branch
+        action_h1 = Dense(256, activation='relu', kernel_initializer=tf.keras.initializers.HeNormal(), dtype='float32')(action_input)
+        action_bn1 = BatchNormalization(dtype='float32')(action_h1)
         
-        merged = concatenate([state_h2, action_h1])
-        merged_h1 = Dense(64, activation='relu')(merged)
-        merged_h2 = Dense(32, activation='relu')(merged_h1)
-        output = Dense(1, activation='linear')(merged_h2)
+        # Merge
+        merged = concatenate([state_bn2, action_bn1])
+        merged_h1 = Dense(256, activation='relu', kernel_initializer=tf.keras.initializers.HeNormal(), dtype='float32')(merged)
+        merged_bn1 = BatchNormalization(dtype='float32')(merged_h1)
+        merged_h2 = Dense(128, activation='relu', kernel_initializer=tf.keras.initializers.HeNormal(), dtype='float32')(merged_bn1)
+        output = Dense(1, activation='linear', kernel_initializer=tf.keras.initializers.GlorotNormal(), dtype='float32')(merged_h2)
         
         model = Model(inputs=[state_input, action_input], outputs=output)
         model.compile(loss='mse', optimizer=self.critic_optimizer)
@@ -215,28 +309,29 @@ class DRLAgent:
         self.memory.push(state, action, reward, next_state, done)
     
     def train(self):
-        """Train the agent using experiences from memory"""
+        """Train the agent using experiences from memory with GPU optimizations"""
         if len(self.memory) < BATCH_SIZE:
             return
         
+        # Sample a larger batch for better GPU utilization
         states, actions, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
         
-        # Convert to tensors
+        # Convert to tensors with proper GPU-friendly types, explicitly specifying float32
         states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
         actions_tensor = tf.convert_to_tensor(actions, dtype=tf.float32)
         rewards_tensor = tf.convert_to_tensor(rewards, dtype=tf.float32)
         next_states_tensor = tf.convert_to_tensor(next_states, dtype=tf.float32)
         dones_tensor = tf.convert_to_tensor(dones, dtype=tf.float32)
         
-        # Calculate target Q-values in a single batch
-        next_actions = self.actor(next_states_tensor)
-        q_next = self.critic([next_states_tensor, next_actions])
+        # Calculate target Q-values using target models for stability
+        # This calculation can be done in a single batched operation for speed
+        next_actions = self.target_actor(next_states_tensor, training=False)
+        # Explicitly cast q_next to float32 to match other tensors
+        q_next = tf.cast(self.target_critic([next_states_tensor, next_actions], training=False), dtype=tf.float32)
         q_targets = rewards_tensor + (1 - dones_tensor) * self.gamma * q_next[:, 0]
         
-        # Train critic using optimized function
+        # Run critic and actor training with optimized GPU functions
         critic_loss = self._critic_train_step(states_tensor, actions_tensor, tf.expand_dims(q_targets, axis=1))
-        
-        # Train actor using optimized function
         actor_loss = self._actor_train_step(states_tensor)
         
         # Decay epsilon
@@ -244,79 +339,160 @@ class DRLAgent:
             self.epsilon *= self.epsilon_decay
         
         return {"critic_loss": critic_loss.numpy(), "actor_loss": actor_loss.numpy()}
-    
+
     def save_models(self, path=None):
-        """Save actor and critic models using TensorFlow checkpoints"""
+        """Save actor and critic models using TensorFlow checkpoints and .keras format"""
+        # Use .keras format for path-based saving (recommended)
         if path:
-            # Save models in Keras format
-            self.actor.save(f"{path}/actor_model.h5")
-            self.critic.save(f"{path}/critic_model.h5")
-        
-        # Save in checkpoint format
-        actor_path = self.actor_manager.save()
-        critic_path = self.critic_manager.save()
-        
-        # Save replay buffer
-        self.memory.save(f"{self.checkpoint_dir}/replay_buffer.pkl")
-        
-        logger.info(f"Models saved to {actor_path} and {critic_path}")
+            Path(path).mkdir(exist_ok=True) # Ensure directory exists
+            try:
+                self.actor.save(f"{path}/actor_model.keras")
+                self.critic.save(f"{path}/critic_model.keras")
+                logger.info(f"Models saved in .keras format to {path}")
+            except Exception as e:
+                logger.error(f"Failed to save models in .keras format: {e}")
+
+        # Save in checkpoint format (always do this)
+        try:
+            actor_path = self.actor_manager.save()
+            critic_path = self.critic_manager.save()
+            logger.info(f"Checkpoint saved: Actor to {actor_path}, Critic to {critic_path}")
+        except Exception as e:
+            logger.error(f"Failed to save checkpoints: {e}")
+            actor_path, critic_path = None, None # Indicate failure
+
+        # Save replay buffer using the correct extension (.npz)
+        buffer_path = f"{self.checkpoint_dir}/replay_buffer.npz"
+        try:
+            self.memory.save(buffer_path)
+            logger.info(f"Replay buffer saved to {buffer_path}")
+        except Exception as e:
+            logger.error(f"Failed to save replay buffer: {e}")
+
         return actor_path, critic_path
     
     def load_models(self, path=None):
-        if path and os.path.exists(f"{path}/actor_model.h5") and os.path.exists(f"{path}/critic_model.h5"):
-            import tensorflow as tf
-            # Try with metrics instead of losses
-            self.actor = load_model(f"{path}/actor_model.h5", custom_objects={'mse': tf.keras.metrics.MeanSquaredError()})
-            self.critic = load_model(f"{path}/critic_model.h5", custom_objects={'mse': tf.keras.metrics.MeanSquaredError()})
-            logger.info(f"Models loaded from {path}")
-            
-            # Important: Recreate optimizers with the new model variables
-            self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
-            self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
-            
-            # Needed for optimizer to know about the variables
-            dummy_state = np.zeros((1, self.state_dim), dtype=np.float32)
-            dummy_action = np.zeros((1, self.action_dim), dtype=np.float32)
-            
-            # Initialize the optimizer with model variables
-            with tf.GradientTape() as tape:
-                actions_pred = self.actor(dummy_state)
-                _ = self.critic([dummy_state, dummy_action])
-            
-            # Try to load replay buffer
-            buffer_path = f"{self.checkpoint_dir}/replay_buffer.pkl"
-            if self.memory.load(buffer_path):
-                logger.info(f"Replay buffer loaded from {buffer_path}")
-            
-            return True
+        """Load models, prioritizing checkpoints, then .keras files."""
+        checkpoint_loaded = False
+        # --- Attempt 1: Load from Checkpoints ---
+        if self.actor_manager.latest_checkpoint and self.critic_manager.latest_checkpoint:
+            try:
+                logger.info(f"Attempting to restore models from checkpoints: {self.actor_manager.latest_checkpoint}")
+                # Restore model weights using the checkpoint objects
+                actor_status = self.actor_checkpoint.restore(self.actor_manager.latest_checkpoint)
+                critic_status = self.critic_checkpoint.restore(self.critic_manager.latest_checkpoint)
+
+                # Optional: Verify restoration if needed (can be verbose)
+                # actor_status.assert_existing_objects_matched().expect_partial()
+                # critic_status.assert_existing_objects_matched().expect_partial()
+
+                logger.info("Models successfully restored from checkpoints.")
+
+                # CRITICAL: Re-initialize optimizers *after* restoring model weights
+                # The optimizer state is also restored by the checkpoint if it was saved.
+                # If optimizers were part of the checkpoint (they are), restoration handles them.
+                # We just need to make sure the agent's optimizer attributes point correctly.
+                self.actor_optimizer = self.actor_checkpoint.optimizer
+                self.critic_optimizer = self.critic_checkpoint.optimizer
+
+                checkpoint_loaded = True
+
+            except Exception as e:
+                logger.warning(f"Checkpoint restoration failed: {e}. Trying other methods...")
+                # Fall through to try path-based loading
+
+        # Load replay buffer - always try this after attempting checkpoint load
+        buffer_path = f"{self.checkpoint_dir}/replay_buffer.npz"
+        if self.memory.load(buffer_path):
+            logger.info(f"Replay buffer loaded from {buffer_path}")
         else:
-            # Try loading from checkpoint
-            actor_status = self.actor_checkpoint.restore(self.actor_manager.latest_checkpoint)
-            critic_status = self.critic_checkpoint.restore(self.critic_manager.latest_checkpoint)
-            
-            if self.actor_manager.latest_checkpoint and self.critic_manager.latest_checkpoint:
-                logger.info(f"Models restored from checkpoints")
-                return True
+             logger.warning(f"Replay buffer not found or failed to load from {buffer_path}")
+
+
+        if checkpoint_loaded:
+             return True # Successfully loaded from checkpoint
+
+        # --- Attempt 2: Load from .keras files (if path provided) ---
+        if path:
+            keras_actor_path = f"{path}/actor_model.keras"
+            keras_critic_path = f"{path}/critic_model.keras"
+
+            if os.path.exists(keras_actor_path) and os.path.exists(keras_critic_path):
+                logger.info(f"Attempting to load models from .keras files in {path}")
+                try:
+                    # No custom_objects usually needed for .keras format with standard layers/ops
+                    self.actor = load_model(keras_actor_path, compile=False) # Re-compile after loading
+                    self.critic = load_model(keras_critic_path, compile=False)
+
+                    # Re-compile the models with their respective optimizers
+                    self.actor.compile(optimizer=self.actor_optimizer, loss='mse') # Loss might not matter if only using for inference/gradients
+                    self.critic.compile(optimizer=self.critic_optimizer, loss='mse')
+
+                    logger.info(f"Models successfully loaded from .keras files in {path}")
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to load models from .keras files in {path}: {e}. Trying H5 fallback...")
             else:
-                logger.warning("No models found to load")
-                return False
+                 logger.info(f".keras models not found in {path}. Checking for H5 fallback...")
+
+            # --- Attempt 3: Load from H5 files (Fallback - Not Recommended) ---
+            h5_actor_path = f"{path}/actor_model.h5"
+            h5_critic_path = f"{path}/critic_model.h5"
+            if os.path.exists(h5_actor_path) and os.path.exists(h5_critic_path):
+                 logger.warning(f"Attempting to load models from legacy .h5 files in {path}. This is not recommended with mixed precision.")
+                 try:
+                     # H5 loading might still fail with 'Cast' error even with scope
+                     with tf.keras.utils.custom_object_scope({'mse': tf.keras.metrics.MeanSquaredError()}):
+                          self.actor = load_model(h5_actor_path, compile=False)
+                          self.critic = load_model(h5_critic_path, compile=False)
+
+                     # Re-compile the models
+                     self.actor.compile(optimizer=self.actor_optimizer, loss='mse')
+                     self.critic.compile(optimizer=self.critic_optimizer, loss='mse')
+
+                     logger.info(f"Models successfully loaded from legacy .h5 files in {path}")
+                     return True
+                 except ValueError as ve:
+                      if 'Unknown layer: \'Cast\'' in str(ve):
+                           logger.error(f"Loading from .h5 failed due to 'Cast' layer issue, as expected with mixed precision. Cannot load these files.")
+                      else:
+                           logger.error(f"Error loading models from .h5 files: {ve}")
+                 except Exception as e:
+                      logger.error(f"Unexpected error loading models from .h5 files: {e}")
+            else:
+                logger.info(f"Legacy .h5 models not found in {path}.")
+
+        # --- Failed to load ---
+        logger.error("Failed to load models from checkpoints or specified path.")
+        return False
 
 class StockTradingEnvironment:
+    # Class-level cache for stock data across all instances
+    _global_data_cache = {}
+    
     def __init__(self, symbols, initial_balance, lookback_window):
         self.symbols = symbols
         self.initial_balance = initial_balance
         self.lookback_window = lookback_window
+        # Instance-level cache reference
         self.data_cache = {}
+        # Precompute fixed values
+        self.shares_normalization = 100.0
+        self.price_normalization = 1000.0
+        # Preallocate state array size for reuse
+        self.state_size = (len(self.symbols) * 2) + 1 + (len(self.symbols) * self.lookback_window)
         self.reset()
         
     def reset(self):
         """Reset the environment for new episode"""
         self.balance = self.initial_balance
+        # Use numpy arrays for shares for vectorized operations
         self.shares = {symbol: 0 for symbol in self.symbols}
         self.data = self._get_data()
         
-        # Ensure we have enough data for lookback window
-        min_data_length = min([len(self.data[symbol]) for symbol in self.symbols])
+        # Ensure we have enough data for lookback window - use numpy for efficiency
+        data_lengths = np.array([len(self.data[symbol]) for symbol in self.symbols])
+        min_data_length = np.min(data_lengths)
         
         # Set current step to lookback_window or to data length if not enough data
         self.current_step = min(self.lookback_window, min_data_length - 1)
@@ -324,12 +500,195 @@ class StockTradingEnvironment:
             logger.warning(f"Not enough data for full lookback window. Using {self.current_step} days instead.")
         
         self.done = False
+        # Pre-allocate memory for history
         self.portfolio_value_history = [self.initial_balance]
         
-        return self._get_state()
+        # Pre-cache current prices for all symbols
+        self._update_current_prices()
         
+        return self._get_state()
+    
+    def _update_current_prices(self):
+        """Cache current prices for all symbols to avoid repeated lookups"""
+        self.current_prices = {}
+        for symbol in self.symbols:
+            try:
+                current_price = self.data[symbol]['Close'].iloc[self.current_step]
+                
+                # Convert to scalar if necessary
+                if isinstance(current_price, pd.Series):
+                    current_price = current_price.iloc[0] if len(current_price) > 0 else 0.0
+                elif hasattr(current_price, 'item') and hasattr(current_price, 'size') and current_price.size == 1:
+                    current_price = current_price.item()
+                elif hasattr(current_price, 'shape') and len(current_price.shape) > 0:
+                    current_price = current_price[0] if current_price.size > 0 else 0.0
+                
+                self.current_prices[symbol] = float(current_price)
+            except Exception as e:
+                logger.error(f"Error updating current price for {symbol}: {e}")
+                self.current_prices[symbol] = 100.0  # Default price
+    
+    def _get_state(self):
+        """Create state representation with vectorized operations for better performance"""
+        # Reuse pre-allocated array for better performance
+        state = np.zeros(self.state_size, dtype=np.float32)
+        
+        # Current price and holdings with vectorized operations
+        for i, symbol in enumerate(self.symbols):
+            try:
+                # Use cached price
+                current_price = self.current_prices[symbol]
+                
+                # Directly assign to pre-allocated array (faster)
+                state[i*2] = current_price / self.price_normalization  # Normalize price
+                state[i*2+1] = self.shares[symbol] / self.shares_normalization  # Normalize shares
+                
+            except Exception as e:
+                logger.error(f"Error accessing price data for {symbol} at step {self.current_step}: {e}")
+                # Use default values
+                state[i*2] = 0.0
+                state[i*2+1] = 0.0
+        
+        # Add normalized balance
+        state[len(self.symbols) * 2] = self.balance / self.initial_balance
+        
+        # Add historical price data in a vectorized way
+        lookback_start_idx = (len(self.symbols) * 2) + 1
+        for i, symbol in enumerate(self.symbols):
+            try:
+                # Calculate slice indices for faster processing
+                if self.current_step < self.lookback_window:
+                    # Handle insufficient data case
+                    available_data = self.data[symbol]['Close'].iloc[:self.current_step].values
+                    
+                    # Ensure available_data is 1D
+                    if hasattr(available_data, 'shape') and len(available_data.shape) > 1:
+                        available_data = available_data.flatten()
+                    
+                    # Use numpy operations for better performance
+                    if len(available_data) > 0:
+                        # Get first value for padding, ensuring it's a scalar
+                        first_value = available_data[0]
+                        if hasattr(first_value, 'item'):
+                            first_value = first_value.item()
+                        # Create padding array and concatenate in one operation
+                        padding = np.full(self.lookback_window - len(available_data), first_value, dtype=np.float32)
+                        prices = np.concatenate([padding, available_data])
+                    else:
+                        prices = np.full(self.lookback_window, 100.0, dtype=np.float32)
+                else:
+                    # Fast slicing for normal case - use numpy array directly if possible
+                    price_data = self.data[symbol]['Close']
+                    if hasattr(price_data, 'values'):
+                        prices_array = price_data.values
+                        start_idx = self.current_step - self.lookback_window
+                        end_idx = self.current_step
+                        if start_idx >= 0 and end_idx <= len(prices_array):
+                            prices = prices_array[start_idx:end_idx]
+                        else:
+                            prices = price_data.iloc[start_idx:end_idx].values
+                    else:
+                        prices = price_data.iloc[self.current_step-self.lookback_window:self.current_step].values
+                    
+                    # Ensure prices is 1D
+                    if hasattr(prices, 'shape') and len(prices.shape) > 1:
+                        prices = prices.flatten()
+                
+                # Normalize in a vectorized way - avoid recalculating max for each value
+                price_max = np.max(prices) if prices.size > 0 else 1.0
+                # Avoid div by zero with maximum that's guaranteed to be at least a small positive value
+                normalized_prices = prices / max(price_max, 1e-8)
+                
+                # Direct assignment to state array slice (much faster than extend)
+                state_start = lookback_start_idx + (i * self.lookback_window)
+                state_end = state_start + self.lookback_window
+                
+                # Make sure we have the right number of values
+                if len(normalized_prices) == self.lookback_window:
+                    state[state_start:state_end] = normalized_prices
+                else:
+                    # If sizes don't match, pad or truncate
+                    state[state_start:state_end] = np.resize(normalized_prices, self.lookback_window)
+                    
+            except Exception as e:
+                logger.error(f"Error processing price history for {symbol}: {e}")
+                # Add zeroes to maintain state vector size
+                state_start = lookback_start_idx + (i * self.lookback_window)
+                state_end = state_start + self.lookback_window
+                state[state_start:state_end] = 0.0
+        
+        return state
+    
+    def _calculate_portfolio_value(self):
+        """Calculate current portfolio value"""
+        # Use the cached current prices for faster calculation
+        portfolio_value = self.balance
+        
+        # Vectorized calculation using numpy for efficiency
+        for symbol in self.symbols:
+            portfolio_value += self.shares[symbol] * self.current_prices[symbol]
+        
+        return portfolio_value
+    
+    def step(self, action):
+        """Execute action and return new state, reward, done"""
+        # Map continuous actions to discrete buy/sell decisions
+        for i, symbol in enumerate(self.symbols):
+            action_idx = i * 3
+            # Each stock has 3 action dimensions: buy, hold, sell
+            buy_signal = max(0, action[action_idx])
+            sell_signal = max(0, -action[action_idx + 1])
+            
+            # Use cached current price
+            current_price = self.current_prices[symbol]
+            
+            # Calculate shares to buy/sell based on the signal strength
+            shares_to_buy = int(buy_signal * MAX_SHARES_PER_TRADE)
+            shares_to_sell = int(sell_signal * min(MAX_SHARES_PER_TRADE, self.shares[symbol]))
+            
+            # Execute buy order if possible
+            cost = shares_to_buy * current_price
+            if cost <= self.balance and shares_to_buy > 0:
+                self.balance -= cost
+                self.shares[symbol] += shares_to_buy
+            
+            # Execute sell order
+            if shares_to_sell > 0:
+                self.balance += shares_to_sell * current_price
+                self.shares[symbol] -= shares_to_sell
+        
+        # Move to next time step
+        self.current_step += 1
+        
+        # Check if we've reached the end of our data
+        min_data_length = min(len(self.data[symbol]) for symbol in self.symbols)
+        if self.current_step >= min_data_length - 1:
+            self.done = True
+        
+        # Update current prices for the new time step
+        self._update_current_prices()
+        
+        # Calculate reward as portfolio value change
+        old_portfolio_value = self.portfolio_value_history[-1]
+        new_portfolio_value = self._calculate_portfolio_value()
+        
+        # Avoid division by zero and use faster calculation
+        if old_portfolio_value > 0:
+            reward = (new_portfolio_value - old_portfolio_value) / old_portfolio_value
+        else:
+            reward = 0.0
+        
+        self.portfolio_value_history.append(new_portfolio_value)
+        
+        return self._get_state(), reward, self.done, {"portfolio_value": new_portfolio_value}
+    
     def _get_data(self):
         """Get historical stock data for all symbols with caching using yfinance"""
+        # Check if we already have all the data loaded in class-level memory
+        if all(symbol in self._global_data_cache for symbol in self.symbols):
+            logger.info("Using in-memory cached data for all symbols")
+            return {symbol: self._global_data_cache[symbol] for symbol in self.symbols}
+        
         end_date = datetime.now()
         # Get more data to ensure we have enough for lookback
         start_date = end_date - timedelta(days=365 + self.lookback_window * 2)
@@ -340,7 +699,13 @@ class StockTradingEnvironment:
         
         data = {}
         for symbol in self.symbols:
-            # Check if data is already cached
+            # First check if data is already in class-level memory
+            if symbol in self._global_data_cache:
+                logger.info(f"Using in-memory cached data for {symbol}")
+                data[symbol] = self._global_data_cache[symbol]
+                continue
+            
+            # Then check if data is already cached on disk
             cache_file = CACHE_DIR / f"{symbol}_{start_date_str}_{end_date_str}.pkl"
             
             if cache_file.exists():
@@ -348,6 +713,8 @@ class StockTradingEnvironment:
                     stock_data = pd.read_pickle(cache_file)
                     logger.info(f"Loaded cached data for {symbol} from {cache_file}")
                     data[symbol] = stock_data
+                    # Store in memory for future use
+                    self._global_data_cache[symbol] = stock_data
                     continue
                 except Exception as e:
                     logger.warning(f"Failed to load cached data for {symbol}: {e}")
@@ -402,6 +769,8 @@ class StockTradingEnvironment:
                 logger.info(f"Downloaded and cached {len(stock_data)} days of data for {symbol}")
                 
                 data[symbol] = stock_data
+                # Store in memory for future use
+                self._global_data_cache[symbol] = stock_data
                 
             except Exception as e:
                 logger.error(f"Error downloading data for {symbol}: {e}")
@@ -411,138 +780,25 @@ class StockTradingEnvironment:
                                         columns=['Open', 'High', 'Low', 'Close', 'Volume'])
                 stock_data['Close'] = 100.0  # Default price
                 data[symbol] = stock_data
+                # Store dummy data in memory too
+                self._global_data_cache[symbol] = stock_data
 
         return data
     
-    def _get_state(self):
-        """Create state representation with price, holdings, balance, and price history"""
-        state = []
-        
-        # Current price, holdings and balance (normalized)
+    def prefetch_data(self):
+        """Prefetch data to memory for faster training (CPU-optimized version)"""
+        # Convert and cache frequently accessed data for faster access
+        prefetched_data = {}
         for symbol in self.symbols:
             try:
-                current_price = self.data[symbol]['Close'].iloc[self.current_step]
-                # Extract float value from pandas Series if needed
-                if hasattr(current_price, 'iloc'):
-                    current_price = current_price.iloc[0]
-                state.append(current_price / 1000.0)  # Normalize price
-                state.append(self.shares[symbol] / 100.0)  # Normalize shares
-            except IndexError as e:
-                logger.error(f"Error accessing price data for {symbol} at step {self.current_step}")
-                logger.error(f"Data length: {len(self.data[symbol])}")
-                raise e
-        
-        state.append(self.balance / self.initial_balance)  # Normalized balance
-        
-        # Historical price data
-        for symbol in self.symbols:
-            try:
-                # Make sure we have enough data
-                if self.current_step < self.lookback_window:
-                    available_data = self.data[symbol]['Close'].iloc[:self.current_step].values
-                    # Pad with the earliest available price if needed
-                    if len(available_data) > 0:
-                        padding = np.full(self.lookback_window - len(available_data), available_data[0])
-                        prices = np.concatenate([padding, available_data])
-                    else:
-                        # If no data at all, use a default value
-                        prices = np.full(self.lookback_window, 100.0)  # Default price
-                else:
-                    prices = self.data[symbol]['Close'].iloc[self.current_step-self.lookback_window:self.current_step].values
-                
-                # Avoid division by zero
-                price_max = prices.max()
-                if price_max == 0:
-                    normalized_prices = prices
-                else:
-                    normalized_prices = prices / price_max
-                    
-                # Flatten any nested structures and ensure they're all scalars
-                for price in normalized_prices.tolist():
-                    if isinstance(price, (list, tuple, np.ndarray)):
-                        # If the price is still a container, take the first element
-                        state.append(float(price[0]))
-                    else:
-                        state.append(float(price))
+                # Only prefetch what we need (close prices)
+                # Store as numpy array for CPU optimization
+                close_prices = np.asarray(self.data[symbol]['Close'].values, dtype=np.float32)
+                prefetched_data[symbol] = close_prices
             except Exception as e:
-                logger.error(f"Error processing price history for {symbol}: {e}")
-                # Add placeholder data to maintain state vector size
-                state.extend([0.0] * self.lookback_window)
+                logger.error(f"Error prefetching data for {symbol}: {e}")
         
-        # Final check to ensure all state elements are scalar
-        for i in range(len(state)):
-            if hasattr(state[i], "__len__") and not isinstance(state[i], (str, bytes)):
-                if hasattr(state[i], 'iloc'):  # Handle pandas Series
-                    state[i] = float(state[i].iloc[0])
-                elif len(state[i]) > 0:  # Handle list, array, etc.
-                    state[i] = float(state[i][0])
-                else:
-                    state[i] = 0.0  # Default for empty containers
-        
-        return np.array(state, dtype=np.float32)  # Force float32 for TensorFlow efficiency
-    
-    def _calculate_portfolio_value(self):
-        """Calculate current portfolio value"""
-        portfolio_value = self.balance
-        
-        for symbol in self.symbols:
-            current_price = self.data[symbol]['Close'].iloc[self.current_step]
-            # Convert to scalar if it's a Series
-            if hasattr(current_price, 'item'):
-                current_price = current_price.item()
-            elif isinstance(current_price, pd.Series):
-                current_price = current_price.iloc[0]
-            
-            portfolio_value += self.shares[symbol] * current_price
-        
-        return portfolio_value
-    
-    def step(self, action):
-        """Execute action and return new state, reward, done"""
-        # Map continuous actions to discrete buy/sell decisions
-        for i, symbol in enumerate(self.symbols):
-            action_idx = i * 3
-            # Each stock has 3 action dimensions: buy, hold, sell
-            buy_signal = max(0, action[action_idx])
-            sell_signal = max(0, -action[action_idx + 1])
-            
-            current_price = self.data[symbol]['Close'].iloc[self.current_step]
-            # Convert to scalar if it's a Series
-            if hasattr(current_price, 'item'):
-                current_price = current_price.item()
-            elif isinstance(current_price, pd.Series):
-                current_price = current_price.iloc[0]
-            
-            # Calculate shares to buy/sell based on the signal strength
-            shares_to_buy = int(buy_signal * MAX_SHARES_PER_TRADE)
-            shares_to_sell = int(sell_signal * min(MAX_SHARES_PER_TRADE, self.shares[symbol]))
-            
-            # Execute buy order if possible
-            cost = shares_to_buy * current_price
-            if cost <= self.balance and shares_to_buy > 0:
-                self.balance -= cost
-                self.shares[symbol] += shares_to_buy
-            
-            # Execute sell order
-            if shares_to_sell > 0:
-                self.balance += shares_to_sell * current_price
-                self.shares[symbol] -= shares_to_sell
-        
-        # Move to next time step
-        self.current_step += 1
-        
-        # Check if we've reached the end of our data
-        if self.current_step >= min(len(self.data[symbol]) for symbol in self.symbols) - 1:
-            self.done = True
-        
-        # Calculate reward as portfolio value change
-        old_portfolio_value = self.portfolio_value_history[-1]
-        new_portfolio_value = self._calculate_portfolio_value()
-        reward = (new_portfolio_value - old_portfolio_value) / old_portfolio_value
-        
-        self.portfolio_value_history.append(new_portfolio_value)
-        
-        return self._get_state(), reward, self.done, {"portfolio_value": new_portfolio_value}
+        return prefetched_data
 
 class AlpacaTradingSystem:
     def __init__(self, agent, symbols):
@@ -589,16 +845,26 @@ class AlpacaTradingSystem:
                 
                 if not current_data.empty:
                     current_price = current_data['Close'].iloc[-1]
+                    # Convert to scalar if necessary
+                    if isinstance(current_price, pd.Series):
+                        current_price = current_price.iloc[0] if len(current_price) > 0 else 100.0
+                    elif hasattr(current_price, 'item') and hasattr(current_price, 'size') and current_price.size == 1:
+                        current_price = current_price.item()
                 else:
                     # Try downloading with a different method
                     df = yf.download(symbol, period="1d", progress=False)
                     if not df.empty:
                         current_price = df['Close'].iloc[-1]
+                        # Convert to scalar if necessary
+                        if isinstance(current_price, pd.Series):
+                            current_price = current_price.iloc[0] if len(current_price) > 0 else 100.0
+                        elif hasattr(current_price, 'item') and hasattr(current_price, 'size') and current_price.size == 1:
+                            current_price = current_price.item()
                     else:
                         logger.warning(f"No price data for {symbol}, using default price")
                         current_price = 100.0
                 
-                state.append(current_price / 1000.0)  # Normalize price
+                state.append(float(current_price) / 1000.0)  # Normalize price
                 state.append(positions[symbol] / 100.0)  # Normalize position
                 
                 logger.info(f"Current price for {symbol}: ${current_price:.2f}")
@@ -624,41 +890,44 @@ class AlpacaTradingSystem:
                 
                 if not hist_data.empty and len(hist_data) >= LOOKBACK_WINDOW:
                     prices = hist_data['Close'].values[-LOOKBACK_WINDOW:]
+                    
+                    # Ensure prices is a 1D array
+                    if hasattr(prices, 'shape') and len(prices.shape) > 1:
+                        prices = prices.flatten()
                 else:
                     logger.warning(f"Not enough history for {symbol}. Using available data.")
                     if not hist_data.empty:
                         available_prices = hist_data['Close'].values
-                        padding = np.full(LOOKBACK_WINDOW - len(available_prices), available_prices[0] if len(available_prices) > 0 else 100.0)
+                        # Ensure available_prices is a 1D array
+                        if hasattr(available_prices, 'shape') and len(available_prices.shape) > 1:
+                            available_prices = available_prices.flatten()
+                            
+                        first_value = available_prices[0] if len(available_prices) > 0 else 100.0
+                        # Convert first_value to scalar if necessary
+                        if hasattr(first_value, 'item'):
+                            first_value = first_value.item()
+                            
+                        padding = np.full(LOOKBACK_WINDOW - len(available_prices), first_value)
                         prices = np.concatenate([padding, available_prices])
                     else:
                         prices = np.full(LOOKBACK_WINDOW, 100.0)  # Default price
                 
-                # Normalize prices
-                price_max = max(prices) if max(prices) > 0 else 1.0
-                normalized_prices = []
-                for p in prices:
-                    # Ensure p is a scalar
-                    if hasattr(p, 'shape') and len(p.shape) > 0:
-                        p_scalar = p.item() if p.size == 1 else p[0]
-                    elif isinstance(p, (list, tuple)) and len(p) > 0:
-                        p_scalar = p[0]
+                # Ensure prices is 1D and contains only scalars
+                prices_1d = np.zeros(len(prices), dtype=np.float32)
+                for j, p in enumerate(prices):
+                    if hasattr(p, 'item') and hasattr(p, 'size') and p.size == 1:
+                        prices_1d[j] = p.item()
+                    elif isinstance(p, pd.Series):
+                        prices_1d[j] = p.iloc[0] if len(p) > 0 else 0.0
+                    elif hasattr(p, 'shape') and len(p.shape) > 0:
+                        prices_1d[j] = p[0] if p.size > 0 else 0.0
                     else:
-                        p_scalar = p
-                    normalized_prices.append(float(p_scalar) / price_max)
+                        prices_1d[j] = float(p)
                 
-                if hasattr(prices, 'shape') and len(prices.shape) > 1:
-                    prices = np.ravel(prices)
-                    
-                # Ensure price_max is a scalar
-                price_max = float(np.max(prices)) if prices.size > 0 else 1.0
+                # Normalize prices
+                price_max = np.max(prices_1d) if prices_1d.size > 0 else 1.0
+                normalized_prices = prices_1d / max(price_max, 1e-8)  # Avoid div by zero
                 
-                # Process each price safely
-                normalized_prices = []
-                for p in prices:
-                    if hasattr(p, 'item'):
-                        p = p.item()
-                    normalized_prices.append(float(p) / price_max)
-                    
                 state.extend(normalized_prices)
                 
             except Exception as e:
@@ -789,12 +1058,30 @@ class AlpacaTradingSystem:
         return actions
 
 def train_agent():
-    """Train the DRL agent using historical data with GPU acceleration"""
+    """Train the DRL agent using historical data with optimized GPU acceleration"""
     env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
     agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
     
     best_reward = -np.inf
     checkpoint_interval = 50  # Save every 50 episodes
+    
+    # Create a dataset from the replay buffer for efficient GPU training
+    def create_training_dataset(buffer, batch_size):
+        # Convert buffer to tensors
+        states, actions, rewards, next_states, dones = zip(*buffer)
+        states = tf.convert_to_tensor(np.array(states), dtype=tf.float32)
+        actions = tf.convert_to_tensor(np.array(actions), dtype=tf.float32)
+        rewards = tf.convert_to_tensor(np.array(rewards), dtype=tf.float32)
+        next_states = tf.convert_to_tensor(np.array(next_states), dtype=tf.float32)
+        dones = tf.convert_to_tensor(np.array(dones), dtype=tf.float32)
+        
+        # Create dataset
+        dataset = tf.data.Dataset.from_tensor_slices((states, actions, rewards, next_states, dones))
+        dataset = dataset.shuffle(buffer_size=10000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        return dataset
+    
+    # Pre-fetch commonly used data to GPU
+    prefetched_data = env.prefetch_data()
     
     # Create a progress bar for training
     progress_bar = tqdm(range(TRAINING_EPISODES), desc="Training Progress")
@@ -805,19 +1092,23 @@ def train_agent():
         done = False
         episode_losses = []
         
-        # Use mini-batch updates for faster training
+        # Collect experiences for this episode
         while not done:
             action = agent.act(state)
             next_state, reward, done, info = env.step(action)
             
             agent.remember(state, action, reward, next_state, done)
-            losses = agent.train()
-            
-            if losses:
-                episode_losses.append(losses)
             
             state = next_state
             total_reward += reward
+        
+        # Train on collected experiences in larger batches
+        if len(agent.memory) >= BATCH_SIZE:
+            # Multiple training iterations per episode for better learning
+            for _ in range(4):  # Train 4x per episode
+                losses = agent.train()
+                if losses:
+                    episode_losses.append(losses)
         
         # Calculate mean losses for this episode
         if episode_losses:
