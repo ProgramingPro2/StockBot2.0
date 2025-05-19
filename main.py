@@ -32,7 +32,7 @@ if gpus:
         # Set GPU memory limit to leave some for the system (20GB out of 24GB)
         tf.config.experimental.set_virtual_device_configuration(
             gpus[0],
-            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=20000)]
+            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=10000)]
         )
         
         # Enable mixed precision training for faster performance
@@ -98,7 +98,7 @@ ACTION_DIM = len(STOCK_SYMBOLS) * 3
 LEARNING_RATE = 0.001
 GAMMA = 0.95
 BATCH_SIZE = 4096  # For max GPU utilization on RTX 3090 (with mixed precision)
-MEMORY_SIZE = 200000  # Increased for better training stability
+MEMORY_SIZE = 100000  # Increased for better training stability
 
 class ReplayBuffer:
     def __init__(self, capacity, state_dim, action_dim):
@@ -1166,9 +1166,10 @@ def test_agent(agent=None):
         if episode % 10 == 0:  # Print only every 10 episodes to reduce output
             logger.info(f"Test Episode {episode+1}/{TEST_EPISODES}, Final Reward: {total_reward:.4f}, Final Portfolio Value: {info['portfolio_value']:.2f}")
     
-# Calculate statistics
+    # Calculate statistics
     final_values = [portfolio[-1] for portfolio in portfolio_values]
     mean_final_value = np.mean(final_values)
+    median_final_value = np.median(final_values)
     std_final_value = np.std(final_values)
     
     logger.info(f"Testing completed. Mean final portfolio value: ${mean_final_value:.2f} ± ${std_final_value:.2f}")
@@ -1198,19 +1199,20 @@ def test_agent(agent=None):
     plt.ylabel("Portfolio Value ($)")
     plt.legend()
     plt.grid(True)
-    plt.savefig("test_results.png", dpi=300)
+    plt.savefig("test_results.png", dpi=600)
     plt.close()
     
     # Plot the distribution of final values
     plt.figure(figsize=(10, 6))
     plt.hist(final_values, bins=20, alpha=0.7, color='green')
     plt.axvline(mean_final_value, color='r', linestyle='dashed', linewidth=2, label=f'Mean: ${mean_final_value:.2f}')
+    plt.axvline(median_final_value, color='b', linestyle='dashed', linewidth=2, label=f'Median: ${median_final_value:.2f}')
     plt.title("Distribution of Final Portfolio Values")
     plt.xlabel("Final Portfolio Value ($)")
     plt.ylabel("Frequency")
     plt.legend()
     plt.grid(True)
-    plt.savefig("final_values_distribution.png", dpi=300)
+    plt.savefig("final_values_distribution.png", dpi=600)
     plt.close()
     
     return agent
