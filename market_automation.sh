@@ -60,6 +60,14 @@ run_training_mode() {
 	log "Training mode started with PID: $!"
 }
 
+# Function to run script in optimization mode
+run_optimization_mode() {
+	log "Running main.py in OPTIMIZATION mode"
+	cd "$SCRIPT_DIR"
+	nohup "$PYTHON_ENV/bin/python" "$MAIN_SCRIPT" --mode optimize --gpu >"$LOG_DIR/optimization_$CURRENT_DATE.log" 2>&1 &
+	log "Optimization mode started with PID: $!"
+}
+
 # Setup cron jobs for this script
 setup_cron_jobs() {
 	log "Setting up cron jobs"
@@ -76,6 +84,7 @@ setup_cron_jobs() {
 	echo "0 9 * * 1-5 $SCRIPT_DIR/market_automation.sh live" >>"$TEMP_CRON"
 	echo "# Market script - run Friday at 4:30pm for training" >>"$TEMP_CRON"
 	echo "30 16 * * 5 $SCRIPT_DIR/market_automation.sh training" >>"$TEMP_CRON"
+	echo "0 22 * * 6 $SCRIPT_DIR/market_automation.sh optimize" >>"$TEMP_CRON"
 	echo "# Market script - run 5 minutes after reboot" >>"$TEMP_CRON"
 	echo "@reboot sleep 300 && $SCRIPT_DIR/market_automation.sh reboot" >>"$TEMP_CRON"
 
@@ -155,6 +164,13 @@ case "$MODE" in
 	reinstall_yfinance
 	run_training_mode
 	log "=== FRIDAY TRAINING MODE SCRIPT COMPLETE ==="
+	;;
+"optimize")
+	log "=== STARTING SATURDAY OPTIMIZATION SCRIPT ==="
+	kill_existing_process
+	reinstall_yfinance
+	run_optimization_mode
+	log "=== SATURDAY OPTIMIZATION SCRIPT COMPLETE ==="
 	;;
 "install")
 	log "=== INSTALLING CRON JOBS ==="

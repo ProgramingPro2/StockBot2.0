@@ -88,7 +88,7 @@ dotenv.load_dotenv()
 # Set up Alpaca API credentials
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
+ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 # Connect to Alpaca API
 api = tradeapi.REST(
@@ -114,6 +114,7 @@ TRADING_FREQUENCY = "minute"
 MAX_SHARES_PER_TRADE = 100
 TRAINING_EPISODES = 1000
 TEST_EPISODES = 1000
+REWARD_SCALING_FACTOR = 1000.0
 
 if os.path.exists("stocks.json"):
     with open("stocks.json", "r") as f:
@@ -133,6 +134,28 @@ if os.path.exists("stocks.json"):
         except Exception as e:
             logger.error(f"Error loading stock symbols from stocks.json: {e}")
 
+# Load hyperparameters if available
+hyperparams_path = Path("./hyperparameters.json")
+if hyperparams_path.exists():
+    with open(hyperparams_path, "r") as f:
+        try:
+            optimized_params = json.load(f)
+            LEARNING_RATE = optimized_params.get("learning_rate", LEARNING_RATE)
+            BATCH_SIZE = optimized_params.get("batch_size", BATCH_SIZE)
+            GAMMA = optimized_params.get("gamma", GAMMA)
+            NOISE_SIGMA = optimized_params.get("noise_sigma", NOISE_SIGMA)
+            NOISE_THETA = optimized_params.get("noise_theta", NOISE_THETA)
+            REWARD_SCALING_FACTOR = optimized_params.get("reward_scaling_factor", REWARD_SCALING_FACTOR)
+            logger.info(f"Loaded optimized hyperparameters from {hyperparams_path}")
+            logger.info(f"  LEARNING_RATE: {LEARNING_RATE}")
+            logger.info(f"  BATCH_SIZE: {BATCH_SIZE}")
+            logger.info(f"  GAMMA: {GAMMA}")
+            logger.info(f"  NOISE_SIGMA: {NOISE_SIGMA}")
+            logger.info(f"  NOISE_THETA: {NOISE_THETA}")
+            logger.info(f"  REWARD_SCALING_FACTOR: {REWARD_SCALING_FACTOR}")
+        except Exception as e:
+            logger.error(f"Error loading optimized hyperparameters: {e}")
+
 # Cache directory for stock data
 CACHE_DIR = Path("./data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
@@ -144,6 +167,8 @@ LEARNING_RATE = 0.001
 GAMMA = 0.95
 BATCH_SIZE = 4096  # For max GPU utilization on RTX 3090 (with mixed precision)
 MEMORY_SIZE = 100000  # Increased for better training stability
+NOISE_SIGMA = 0.15
+NOISE_THETA = 0.2
 
 
 class ReplayBuffer:
@@ -264,7 +289,7 @@ class ReplayBuffer:
 
 
 class DRLAgent:
-    def __init__(self, state_dim, action_dim, learning_rate=0.001):
+    def __init__(self, state_dim, action_dim, learning_rate=LEARNING_RATE, noise_sigma=NOISE_SIGMA, noise_theta=NOISE_THETA):
         self.state_dim = state_dim
         self.action_dim = action_dim
 
@@ -276,7 +301,7 @@ class DRLAgent:
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
         self.learning_rate = learning_rate
-        self.noise = OrnsteinUhlenbeckActionNoise(mu=np.zeros(action_dim))
+        self.noise = OrnsteinUhlenbeckActionNoise(mu=np.zeros(action_dim), sigma=noise_sigma, theta=noise_theta)
 
         # Set default TensorFlow dtype to float32 explicitly
         tf.keras.backend.set_floatx("float32")
@@ -412,7 +437,9 @@ class DRLAgent:
         """TensorFlow function for critic training step"""
         with tf.GradientTape() as tape:
             q_values = self.critic([states, actions], training=True)
-            critic_loss = tf.reduce_mean(tf.square(q_targets - q_values))
+            # Ensure q_values is float32 for calculation with q_targets
+            q_values_float32 = tf.cast(q_values, tf.float32)
+            critic_loss = tf.reduce_mean(tf.square(q_targets - q_values_float32))
 
         critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
         # Apply gradient clipping
@@ -461,7 +488,9 @@ class DRLAgent:
         # This calculation can be done in a single batched operation for speed
         next_actions = self.target_actor(next_states_tensor, training=False)
         q_next = self.target_critic([next_states_tensor, next_actions], training=False)
-        q_targets = rewards_tensor + (1 - dones_tensor) * self.gamma * q_next[:, 0]
+        # Ensure q_next is float32 for calculation with gamma and rewards_tensor
+        q_next_float32 = tf.cast(q_next, tf.float32)
+        q_targets = rewards_tensor + (1 - dones_tensor) * self.gamma * q_next_float32[:, 0]
 
         # Run critic and actor training with optimized GPU functions
         critic_loss = self._critic_train_step(
@@ -819,9 +848,13 @@ class StockTradingEnvironment:
 
             # Calculate shares to buy/sell based on the signal strength
             shares_to_buy = int(buy_signal * MAX_SHARES_PER_TRADE)
+            if buy_signal > 0 and shares_to_buy == 0: # Ensure at least 1 share if signal is positive
+                shares_to_buy = 1
             shares_to_sell = int(
                 sell_signal * min(MAX_SHARES_PER_TRADE, self.shares[symbol])
             )
+            if sell_signal > 0 and shares_to_sell == 0: # Ensure at least 1 share if signal is positive
+                shares_to_sell = 1
 
             # Execute buy order if possible
             cost = shares_to_buy * current_price
@@ -851,7 +884,7 @@ class StockTradingEnvironment:
 
         # Avoid division by zero and use faster calculation
         if old_portfolio_value > 0:
-            reward = (new_portfolio_value - old_portfolio_value) / old_portfolio_value
+            reward = ((new_portfolio_value - old_portfolio_value) / old_portfolio_value) * REWARD_SCALING_FACTOR
         else:
             reward = 0.0
 
@@ -1306,6 +1339,7 @@ def optimize_agent():
         gamma = trial.suggest_uniform("gamma", 0.9, 0.99)
         noise_sigma = trial.suggest_uniform("noise_sigma", 0.05, 0.3)
         noise_theta = trial.suggest_uniform("noise_theta", 0.1, 0.5)
+        reward_scaling_factor = trial.suggest_loguniform("reward_scaling_factor", 10.0, 10000.0)
 
         # Update global parameters or pass them to the agent
         global LEARNING_RATE, BATCH_SIZE, GAMMA
@@ -1319,13 +1353,13 @@ def optimize_agent():
 
         # Train the agent with suggested hyperparameters
         env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
-        agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
-        agent.gamma = GAMMA  # Ensure agent uses the trial's gamma
+        agent = DRLAgent(STATE_DIM, ACTION_DIM, learning_rate, noise_sigma=noise_sigma, noise_theta=noise_theta)
+        agent.gamma = gamma  # Ensure agent uses the trial's gamma
 
         # Train for a reduced number of episodes for optimization speed
         optimization_episodes = 200  # Reduced episodes for faster trials
 
-        for episode in range(optimization_episodes):
+        for episode in tqdm(range(optimization_episodes), desc=f"Trial {trial.number} Training"): # Add tqdm here
             state = env.reset()
             done = False
             while not done:
@@ -1343,7 +1377,7 @@ def optimize_agent():
             STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW
         )
         final_values = []
-        for _ in range(50):  # Reduced test episodes for faster evaluation
+        for _ in tqdm(range(50), desc=f"Trial {trial.number} Testing"): # Add tqdm here
             state = test_env.reset()
             done = False
             while not done:
@@ -1359,7 +1393,9 @@ def optimize_agent():
         return mean_final_value
 
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=50)  # Run 50 trials
+    # Create a progress bar for optimization trials
+    for _ in tqdm(range(args.trials), desc="Optimization Progress (Trials)"):
+        study.optimize(objective, n_trials=1, show_progress_bar=False) # Run one trial at a time to update tqdm
 
     logger.info("Optimization finished.")
     logger.info(f"""Best trial:
@@ -1367,18 +1403,25 @@ def optimize_agent():
   Params: {study.best_params}""")
 
     # Update global parameters with the best found
-    global LEARNING_RATE, BATCH_SIZE, GAMMA
+    global LEARNING_RATE, BATCH_SIZE, GAMMA, REWARD_SCALING_FACTOR
     LEARNING_RATE = study.best_params["learning_rate"]
     BATCH_SIZE = study.best_params["batch_size"]
     GAMMA = study.best_params["gamma"]
+    REWARD_SCALING_FACTOR = study.best_params["reward_scaling_factor"]
 
     logger.info("Global hyperparameters updated to best found values.")
+
+    # Save best hyperparameters to a file
+    hyperparams_path = Path("./hyperparameters.json")
+    with open(hyperparams_path, "w") as f:
+        json.dump(study.best_params, f, indent=4)
+    logger.info(f"Best hyperparameters saved to {hyperparams_path}")
 
 
 def train_agent():
     """Train the DRL agent using historical data with optimized GPU acceleration"""
     env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
-    agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
+    agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE, noise_sigma=NOISE_SIGMA, noise_theta=NOISE_THETA)
 
     best_reward = -np.inf
     checkpoint_interval = 50  # Save every 50 episodes
@@ -1427,7 +1470,7 @@ def train_agent():
             )
             progress_bar.set_postfix(
                 {
-                    "reward": total_reward,
+                    "reward": f"{total_reward:.6f}", # Display more decimal places
                     "value": info["portfolio_value"],
                     "actor_loss": mean_actor_loss,
                     "critic_loss": mean_critic_loss,
@@ -1452,7 +1495,7 @@ def train_agent():
 def test_agent(agent=None):
     """Test the trained agent"""
     if agent is None:
-        agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
+        agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE, noise_sigma=NOISE_SIGMA, noise_theta=NOISE_THETA)
         agent.load_models("./models")
 
     env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
@@ -1479,7 +1522,7 @@ def test_agent(agent=None):
 
         if episode % 10 == 0:  # Print only every 10 episodes to reduce output
             logger.info(
-                f"Test Episode {episode + 1}/{TEST_EPISODES}, Final Reward: {total_reward:.4f}, Final Portfolio Value: {info['portfolio_value']:.2f}"
+                f"Test Episode {episode + 1}/{TEST_EPISODES}, Final Reward: {total_reward:.6f}, Final Portfolio Value: {info['portfolio_value']:.2f}"
             )
 
     # Calculate statistics
@@ -1614,7 +1657,7 @@ def run_live_trading():
     """Run the agent in live trading mode with Alpaca"""
     logger.info("Starting live trading...")
     # Load trained agent
-    agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE)
+    agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE, noise_sigma=NOISE_SIGMA, noise_theta=NOISE_THETA)
     if not agent.load_models("./models"):
         logger.error("Failed to load model weights. Please train the model first.")
         return
@@ -1765,6 +1808,12 @@ if __name__ == "__main__":
         type=int,
         default=TRAINING_EPISODES,
         help="Number of epochs for training",
+    )
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=50,
+        help="Number of trials for hyperparameter optimization",
     )
     parser.add_argument(
         "--gpu",
