@@ -35,7 +35,7 @@ The bot operates based on the interaction between a DRL agent and a simulated st
 
 *   Python 3.8+
 *   An Alpaca paper or live trading account
-*   (Optional) An NVIDIA GPU with CUDA and cuDNN installed for accelerated training
+*   (Recommended) An NVIDIA GPU with CUDA and cuDNN installed for accelerated training
 
 ### Installation
 
