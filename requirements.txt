@@ -7,3 +7,5 @@ yfinance
 python-dotenv
 joblib
 tqdm
+optuna
+ruff
