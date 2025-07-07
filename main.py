@@ -134,6 +134,16 @@ if os.path.exists("stocks.json"):
         except Exception as e:
             logger.error(f"Error loading stock symbols from stocks.json: {e}")
 
+# RL model parameters
+STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)
+ACTION_DIM = len(STOCK_SYMBOLS)
+LEARNING_RATE = 0.001
+GAMMA = 0.95
+BATCH_SIZE = 4096  # For max GPU utilization on RTX 3090 (with mixed precision)
+MEMORY_SIZE = 100000  # Increased for better training stability
+NOISE_SIGMA = 0.15
+NOISE_THETA = 0.2
+
 # Load hyperparameters if available
 hyperparams_path = Path("./hyperparameters.json")
 if hyperparams_path.exists():
@@ -159,16 +169,6 @@ if hyperparams_path.exists():
 # Cache directory for stock data
 CACHE_DIR = Path("./data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
-
-# RL model parameters
-STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)
-ACTION_DIM = len(STOCK_SYMBOLS) * 3
-LEARNING_RATE = 0.001
-GAMMA = 0.95
-BATCH_SIZE = 4096  # For max GPU utilization on RTX 3090 (with mixed precision)
-MEMORY_SIZE = 100000  # Increased for better training stability
-NOISE_SIGMA = 0.15
-NOISE_THETA = 0.2
 
 
 class ReplayBuffer:
@@ -635,43 +635,8 @@ class DRLAgent:
                     )
             else:
                 logger.info(
-                    f".keras models not found in {path}. Checking for H5 fallback..."
+                    f".keras models not found in {path}."
                 )
-
-            # --- Attempt 3: Load from H5 files (Fallback - Not Recommended) ---
-            h5_actor_path = f"{path}/actor_model.h5"
-            h5_critic_path = f"{path}/critic_model.h5"
-            if os.path.exists(h5_actor_path) and os.path.exists(h5_critic_path):
-                logger.warning(
-                    f"Attempting to load models from legacy .h5 files in {path}. This is not recommended with mixed precision."
-                )
-                try:
-                    # H5 loading might still fail with 'Cast' error even with scope
-                    with tf.keras.utils.custom_object_scope(
-                        {"mse": tf.keras.metrics.MeanSquaredError()}
-                    ):
-                        self.actor = load_model(h5_actor_path, compile=False)
-                        self.critic = load_model(h5_critic_path, compile=False)
-
-                    # Re-compile the models
-                    self.actor.compile(optimizer=self.actor_optimizer, loss="mse")
-                    self.critic.compile(optimizer=self.critic_optimizer, loss="mse")
-
-                    logger.info(
-                        f"Models successfully loaded from legacy .h5 files in {path}"
-                    )
-                    return True
-                except ValueError as ve:
-                    if "Unknown layer: 'Cast'" in str(ve):
-                        logger.error(
-                            "Loading from .h5 failed due to 'Cast' layer issue, as expected with mixed precision. Cannot load these files."
-                        )
-                    else:
-                        logger.error(f"Error loading models from .h5 files: {ve}")
-                except Exception as e:
-                    logger.error(f"Unexpected error loading models from .h5 files: {e}")
-            else:
-                logger.info(f"Legacy .h5 models not found in {path}.")
 
         # --- Failed to load ---
         logger.error("Failed to load models from checkpoints or specified path.")
@@ -838,34 +803,24 @@ class StockTradingEnvironment:
         """Execute action and return new state, reward, done"""
         # Map continuous actions to discrete buy/sell decisions
         for i, symbol in enumerate(self.symbols):
-            action_idx = i * 3
-            # Each stock has 3 action dimensions: buy, hold, sell
-            buy_signal = max(0, action[action_idx])
-            sell_signal = max(0, -action[action_idx + 1])
+            signal = action[i]
 
             # Use cached current price
             current_price = self.current_prices[symbol]
 
-            # Calculate shares to buy/sell based on the signal strength
-            shares_to_buy = int(buy_signal * MAX_SHARES_PER_TRADE)
-            if buy_signal > 0 and shares_to_buy == 0: # Ensure at least 1 share if signal is positive
-                shares_to_buy = 1
-            shares_to_sell = int(
-                sell_signal * min(MAX_SHARES_PER_TRADE, self.shares[symbol])
-            )
-            if sell_signal > 0 and shares_to_sell == 0: # Ensure at least 1 share if signal is positive
-                shares_to_sell = 1
-
-            # Execute buy order if possible
-            cost = shares_to_buy * current_price
-            if cost <= self.balance and shares_to_buy > 0:
-                self.balance -= cost
-                self.shares[symbol] += shares_to_buy
-
-            # Execute sell order
-            if shares_to_sell > 0:
-                self.balance += shares_to_sell * current_price
-                self.shares[symbol] -= shares_to_sell
+            if signal > 0:  # Buy signal
+                shares_to_buy = int(signal * MAX_SHARES_PER_TRADE)
+                cost = shares_to_buy * current_price
+                if cost <= self.balance and shares_to_buy > 0:
+                    self.balance -= cost
+                    self.shares[symbol] += shares_to_buy
+            elif signal < 0:  # Sell signal
+                shares_to_sell = int(
+                    -signal * min(MAX_SHARES_PER_TRADE, self.shares[symbol])
+                )
+                if shares_to_sell > 0:
+                    self.balance += shares_to_sell * current_price
+                    self.shares[symbol] -= shares_to_sell
 
         # Move to next time step
         self.current_step += 1
@@ -1192,25 +1147,7 @@ class AlpacaTradingSystem:
 
         # Execute actions
         for i, symbol in enumerate(self.symbols):
-            action_idx = i * 3
-            buy_signal = max(0, actions[action_idx])
-            sell_signal = max(0, -actions[action_idx + 1])
-
-            # Avoid wash trades: only do buy or sell in a single cycle, not both
-            # If both signals are strong, prioritize the stronger one
-            if (
-                buy_signal > 0.1 and sell_signal > 0.1
-            ):  # Threshold to consider a signal "strong"
-                if buy_signal >= sell_signal:
-                    sell_signal = 0
-                    logger.info(
-                        f"Prevented wash trade for {symbol} - prioritizing buy over sell"
-                    )
-                else:
-                    buy_signal = 0
-                    logger.info(
-                        f"Prevented wash trade for {symbol} - prioritizing sell over buy"
-                    )
+            signal = actions[i]
 
             # Get current position
             try:
@@ -1220,30 +1157,66 @@ class AlpacaTradingSystem:
                 logger.error(f"Error getting current shares for {symbol}: {e}")
                 current_shares = 0
 
-            # Calculate shares to buy/sell
-            shares_to_buy = int(buy_signal * MAX_SHARES_PER_TRADE)
-            shares_to_sell = int(
-                sell_signal * min(MAX_SHARES_PER_TRADE, current_shares)
-            )
+            if signal > 0:  # Buy signal
+                shares_to_buy = int(signal * MAX_SHARES_PER_TRADE)
+                if shares_to_buy > 0:
+                    try:
+                        # Get latest price with yfinance before placing order
+                        ticker_data = yf.Ticker(symbol)
+                        latest_data = ticker_data.history(period="1d")
+                        if not latest_data.empty:
+                            current_price = latest_data["Close"].iloc[-1]
+                            logger.info(f"Latest price for {symbol}: ${current_price:.2f}")
 
-            # Execute buy order
-            if shares_to_buy > 0:
-                try:
-                    # Get latest price with yfinance before placing order
-                    ticker_data = yf.Ticker(symbol)
-                    latest_data = ticker_data.history(period="1d")
-                    if not latest_data.empty:
-                        current_price = latest_data["Close"].iloc[-1]
-                        logger.info(f"Latest price for {symbol}: ${current_price:.2f}")
+                        # Retry logic for submit_order
+                        order_placed = False
+                        for order_attempt in range(3): # Max 3 attempts
+                            try:
+                                self.api.submit_order(
+                                    symbol=symbol,
+                                    qty=shares_to_buy,
+                                    side="buy",
+                                    type="market",
+                                    time_in_force="day",
+                                )
+                                order_placed = True
+                                break
+                            except Exception as order_e:
+                                logger.warning(f"Order submission failed for {symbol} (attempt {order_attempt + 1}/3): {order_e}")
+                                time.sleep(5) # Wait before retrying
+                        if not order_placed:
+                            logger.error(f"Failed to place buy order for {symbol} after multiple attempts.")
+                            continue # Skip to next symbol if order fails
+                        logger.info(f"BUY ORDER: {shares_to_buy} shares of {symbol}")
+                        trade_actions.append(f"BUY {symbol}: {shares_to_buy} shares")
 
+                        # Update position tracking
+                        if symbol not in positions:
+                            positions[symbol] = {
+                                "qty": shares_to_buy,
+                                "last_trade": datetime.now(),
+                            }
+                        else:
+                            positions[symbol]["qty"] = (
+                                positions[symbol].get("qty", 0) + shares_to_buy
+                            )
+                            positions[symbol]["last_trade"] = datetime.now()
+
+                    except Exception as e:
+                        logger.error(
+                            f"Buy order failed for {symbol}: {e}, for shares: {shares_to_buy} at total price: {current_price * shares_to_buy}"
+                        )
+            elif signal < 0:  # Sell signal
+                shares_to_sell = int(-signal * min(MAX_SHARES_PER_TRADE, current_shares))
+                if shares_to_sell > 0:
                     # Retry logic for submit_order
                     order_placed = False
                     for order_attempt in range(3): # Max 3 attempts
                         try:
                             self.api.submit_order(
                                 symbol=symbol,
-                                qty=shares_to_buy,
-                                side="buy",
+                                qty=shares_to_sell,
+                                side="sell",
                                 type="market",
                                 time_in_force="day",
                             )
@@ -1253,62 +1226,21 @@ class AlpacaTradingSystem:
                             logger.warning(f"Order submission failed for {symbol} (attempt {order_attempt + 1}/3): {order_e}")
                             time.sleep(5) # Wait before retrying
                     if not order_placed:
-                        logger.error(f"Failed to place buy order for {symbol} after multiple attempts.")
+                        logger.error(f"Failed to place sell order for {symbol} after multiple attempts.")
                         continue # Skip to next symbol if order fails
-                    logger.info(f"BUY ORDER: {shares_to_buy} shares of {symbol}")
-                    trade_actions.append(f"BUY {symbol}: {shares_to_buy} shares")
-
-                    # Update position tracking
-                    if symbol not in positions:
-                        positions[symbol] = {
-                            "qty": shares_to_buy,
-                            "last_trade": datetime.now(),
-                        }
-                    else:
-                        positions[symbol]["qty"] = (
-                            positions[symbol].get("qty", 0) + shares_to_buy
-                        )
-                        positions[symbol]["last_trade"] = datetime.now()
-
-                except Exception as e:
-                    logger.error(
-                        f"Buy order failed for {symbol}: {e}, for shares: {shares_to_buy} at total price: {current_price * shares_to_buy}"
-                    )
-
-            # Execute sell order
-            if shares_to_sell > 0:
-                # Retry logic for submit_order
-                order_placed = False
-                for order_attempt in range(3): # Max 3 attempts
                     try:
-                        self.api.submit_order(
-                            symbol=symbol,
-                            qty=shares_to_sell,
-                            side="sell",
-                            type="market",
-                            time_in_force="day",
-                        )
-                        order_placed = True
-                        break
-                    except Exception as order_e:
-                        logger.warning(f"Order submission failed for {symbol} (attempt {order_attempt + 1}/3): {order_e}")
-                        time.sleep(5) # Wait before retrying
-                if not order_placed:
-                    logger.error(f"Failed to place sell order for {symbol} after multiple attempts.")
-                    continue # Skip to next symbol if order fails
-                try:
-                    logger.info(f"SELL ORDER: {shares_to_sell} shares of {symbol}")
-                    trade_actions.append(f"SELL {symbol}: {shares_to_sell} shares")
+                        logger.info(f"SELL ORDER: {shares_to_sell} shares of {symbol}")
+                        trade_actions.append(f"SELL {symbol}: {shares_to_sell} shares")
 
-                    # Update position tracking
-                    if symbol in positions:
-                        positions[symbol]["qty"] = max(
-                            0, positions[symbol].get("qty", 0) - shares_to_sell
-                        )
-                        positions[symbol]["last_trade"] = datetime.now()
+                        # Update position tracking
+                        if symbol in positions:
+                            positions[symbol]["qty"] = max(
+                                0, positions[symbol].get("qty", 0) - shares_to_sell
+                            )
+                            positions[symbol]["last_trade"] = datetime.now()
 
-                except Exception as e:
-                    logger.error(f"Sell order failed for {symbol}: {e}")
+                    except Exception as e:
+                        logger.error(f"Sell order failed for {symbol}: {e}")
 
         if trade_actions:
             logger.info(f"Actions taken: {', '.join(trade_actions)}")
@@ -1425,9 +1357,6 @@ def train_agent():
 
     best_reward = -np.inf
     checkpoint_interval = 50  # Save every 50 episodes
-
-    # Pre-fetch commonly used data to GPU (if applicable, though not directly used in this training loop)
-    # prefetched_data = env.prefetch_data() # Commented out as it's not directly used in the training loop
 
     # Create a progress bar for training
     progress_bar = tqdm(range(TRAINING_EPISODES), desc="Training Progress")
@@ -1715,23 +1644,16 @@ def run_live_trading():
                     # Log the actions in a more readable format
                     action_summary = []
                     for i, symbol in enumerate(STOCK_SYMBOLS):
-                        action_idx = i * 3
-                        buy_signal = max(0, actions[action_idx])
-                        sell_signal = max(0, -actions[action_idx + 1])
-                        if buy_signal > 0.1:
-                            action_summary.append(f"BUY {symbol}: {buy_signal:.2f}")
-                        elif sell_signal > 0.1:
-                            action_summary.append(f"SELL {symbol}: {sell_signal:.2f}")
+                        signal = actions[i]
+                        if signal > 0.1:  # Buy signal
+                            action_summary.append(f"BUY {symbol}: {signal:.2f}")
+                        elif signal < -0.1:  # Sell signal
+                            action_summary.append(f"SELL {symbol}: {-signal:.2f}")
 
                     # Log all weights
                     logger.info("\n--- Model Weights ---")
                     for i, symbol in enumerate(STOCK_SYMBOLS):
-                        action_idx = i * 3
-                        buy_weight = actions[action_idx]
-                        sell_weight = actions[action_idx + 1]
-                        logger.info(
-                            f"{symbol}: Buy Weight: {buy_weight:.2f}, Sell Weight: {sell_weight:.2f}"
-                        )
+                        logger.info(f"{symbol}: Signal: {actions[i]:.2f}")
 
                     if action_summary:
                         logger.info(f"Actions taken: {', '.join(action_summary)}")
