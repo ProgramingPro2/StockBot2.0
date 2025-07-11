@@ -1,9 +1,8 @@
 pandas
 numpy
-alpaca-trade-api
+alpaca-py
 tensorflow
 matplotlib
-yfinance
 python-dotenv
 joblib
 tqdm

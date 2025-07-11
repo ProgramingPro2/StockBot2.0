@@ -33,17 +33,6 @@ kill_existing_process() {
 	fi
 }
 
-# Function to reinstall yfinance
-reinstall_yfinance() {
-	log "Uninstalling yfinance"
-	"$PYTHON_ENV/bin/pip" uninstall -y yfinance
-
-	log "Reinstalling yfinance"
-	"$PYTHON_ENV/bin/pip" install yfinance
-
-	log "YFinance reinstallation complete"
-}
-
 # Function to run script in live mode
 run_live_mode() {
 	log "Running main.py in LIVE mode"
@@ -154,21 +143,21 @@ case "$MODE" in
 "live")
 	log "=== STARTING DAILY LIVE MODE SCRIPT ==="
 	kill_existing_process
-	reinstall_yfinance
+
 	run_live_mode
 	log "=== DAILY LIVE MODE SCRIPT COMPLETE ==="
 	;;
 "training")
 	log "=== STARTING FRIDAY TRAINING MODE SCRIPT ==="
 	kill_existing_process
-	reinstall_yfinance
+
 	run_training_mode
 	log "=== FRIDAY TRAINING MODE SCRIPT COMPLETE ==="
 	;;
 "optimize")
 	log "=== STARTING SATURDAY OPTIMIZATION SCRIPT ==="
 	kill_existing_process
-	reinstall_yfinance
+
 	run_optimization_mode
 	log "=== SATURDAY OPTIMIZATION SCRIPT COMPLETE ==="
 	;;

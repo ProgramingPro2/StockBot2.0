@@ -8,7 +8,7 @@ This is a sophisticated stock trading bot that uses a Deep Reinforcement Learnin
 *   **GPU Acceleration:** Optimized for GPU usage to significantly speed up the training process, leveraging mixed precision training for RTX 3090.
 *   **Alpaca Integration:** Seamlessly connects with the Alpaca API for live or paper trading, with improved retry mechanisms for order submission.
 *   **Automated Trading:** Includes a bash script for setting up cron jobs to automate daily trading and weekly training sessions.
-*   **Robust Data Handling:** Caches historical stock data to minimize API calls and speeds up initialization with parallel fetching. Includes robust retry logic and data completeness checks for `yfinance`.
+    *   **Robust Data Handling:** Caches historical stock data to minimize API calls and speeds up initialization with parallel fetching. Includes robust retry logic and data completeness checks for Alpaca data API.
 *   **Hyperparameter Optimization:** Integrates `Optuna` to automatically find optimal hyperparameters for the DRL agent, improving model quality and profitability.
 *   **Robustness:** Implements error handling, retry logic, and wash trade prevention to ensure stable operation.
 *   **Improved State Representation:** Enhanced historical data padding in state representation for more accurate agent learning.
