@@ -111,10 +111,10 @@ STOCK_SYMBOLS = [
     "INTC",
     "AMD",
 ]
-INITIAL_BALANCE = 100000.0
+INITIAL_BALANCE = 1000.0
 LOOKBACK_WINDOW = 10
 TRADING_FREQUENCY = "minute"
-MAX_SHARES_PER_TRADE = 100
+MAX_SHARES_PER_TRADE = 5
 TRAINING_EPISODES = 1000
 TEST_EPISODES = 100
 REWARD_SCALING_FACTOR = 1000.0
@@ -868,38 +868,47 @@ class StockTradingEnvironment:
 
         data = {}
         
-        def download_symbol_data(symbol):
+        # Try to load all data from cache first
+        all_cached = True
+        for symbol in self.symbols:
             cache_file = CACHE_DIR / f"{symbol}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.pkl"
-            
             if cache_file.exists():
                 try:
                     stock_data = pd.read_pickle(cache_file)
+                    data[symbol] = stock_data
+                    self._global_data_cache[symbol] = stock_data
                     logger.info(f"Loaded cached data for {symbol} from {cache_file}")
-                    return symbol, stock_data
                 except Exception as e:
-                    logger.warning(f"Failed to load cached data for {symbol}: {e}. Attempting re-download.")
-            
-            try:
-                logger.info(f"Downloading data for {symbol}...")
-                request_params = StockBarsRequest(
-                    symbol_or_symbols=[symbol],
-                    timeframe=TimeFrame.Day,
-                    start=start_date,
-                    end=end_date
-                )
-                stock_data_obj = stock_data_client.get_stock_bars(request_params)
-                stock_data = stock_data_obj.df
+                    logger.warning(f"Failed to load cached data for {symbol}: {e}. Will attempt to re-download.")
+                    all_cached = False
+                    break
+            else:
+                all_cached = False
+                break
 
-                if stock_data.empty:
-                    logger.warning(f"No data available for {symbol} from Alpaca. Creating dummy data.")
-                    dummy_index = pd.date_range(start=start_date, end=end_date, freq="B")
-                    stock_data = pd.DataFrame(
-                        index=dummy_index,
-                        columns=["open", "high", "low", "close", "volume"],
-                    )
-                    stock_data["close"] = 100.0  # Default price
-                    stock_data.fillna(method="ffill", inplace=True)
-                else:
+        if all_cached:
+            logger.info("All data loaded from cache.")
+            return data
+
+        # If not all data is cached, download all missing data in one go
+        symbols_to_download = [s for s in self.symbols if s not in data]
+        if not symbols_to_download: # All data was loaded from cache, nothing to download
+            return data
+
+        logger.info(f"Downloading data for {len(symbols_to_download)} symbols: {symbols_to_download}...")
+        try:
+            request_params = StockBarsRequest(
+                symbol_or_symbols=symbols_to_download,
+                timeframe=TimeFrame.Day,
+                start=start_date,
+                end=end_date
+            )
+            all_stock_data_obj = stock_data_client.get_stock_bars(request_params)
+            all_stock_data = all_stock_data_obj.df
+
+            for symbol in symbols_to_download:
+                if symbol in all_stock_data.index.get_level_values('symbol'):
+                    stock_data = all_stock_data.loc[symbol]
                     # Rename columns to match yfinance output for compatibility
                     stock_data = stock_data.rename(columns={
                         'open': 'Open',
@@ -908,30 +917,38 @@ class StockTradingEnvironment:
                         'close': 'Close',
                         'volume': 'Volume'
                     })
-                    
+                    # Ensure the index is just the date, not datetime
+                    stock_data.index = stock_data.index.map(lambda x: x.date())
+                    stock_data.index.name = 'Date'
 
-                # Cache the data
-                stock_data.to_pickle(cache_file)
-                logger.info(
-                    f"Downloaded and cached {len(stock_data)} days of data for {symbol}"
-                )
-                return symbol, stock_data
+                    cache_file = CACHE_DIR / f"{symbol}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.pkl"
+                    stock_data.to_pickle(cache_file)
+                    data[symbol] = stock_data
+                    self._global_data_cache[symbol] = stock_data
+                    logger.info(f"Downloaded and cached {len(stock_data)} days of data for {symbol}")
+                else:
+                    logger.warning(f"No data available for {symbol} from Alpaca. Creating dummy data.")
+                    dummy_index = pd.date_range(start=start_date, end=end_date, freq="B")
+                    stock_data = pd.DataFrame(
+                        index=dummy_index,
+                        columns=["Open", "High", "Low", "Close", "Volume"],
+                    )
+                    stock_data["Close"] = 100.0  # Default price
+                    stock_data.fillna(method="ffill", inplace=True)
+                    data[symbol] = stock_data
+                    self._global_data_cache[symbol] = stock_data
 
-            except Exception as e:
-                logger.error(f"Error downloading data for {symbol}: {e}")
-                # Create dummy data
+        except Exception as e:
+            logger.error(f"Error downloading batch data from Alpaca: {e}")
+            # Fallback to dummy data for all symbols if batch download fails
+            for symbol in symbols_to_download:
+                logger.warning(f"Creating dummy data for {symbol} due to batch download failure.")
                 dummy_index = pd.date_range(start=start_date, end=end_date, freq="B")
                 stock_data = pd.DataFrame(
                     index=dummy_index,
                     columns=["Open", "High", "Low", "Close", "Volume"],
                 )
                 stock_data["Close"] = 100.0  # Default price
-                return symbol, stock_data
-
-        # Use ThreadPoolExecutor for parallel data fetching
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            results = executor.map(download_symbol_data, self.symbols)
-            for symbol, stock_data in results:
                 data[symbol] = stock_data
                 self._global_data_cache[symbol] = stock_data
 
@@ -988,30 +1005,31 @@ class AlpacaTradingSystem:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=LOOKBACK_WINDOW + 5)  # Add buffer days
 
-        # First add current price data
-        for symbol in self.symbols:
-            try:
-                request_params = StockBarsRequest(
-                    symbol_or_symbols=[symbol],
-                    timeframe=TimeFrame.Minute, # Use minute data for current price
-                    start=end_date - timedelta(minutes=5), # Get last 5 minutes
-                    end=end_date
-                )
-                bars = self.stock_data_client.get_stock_bars(request_params).df
-                if not bars.empty:
-                    current_price = bars["close"].iloc[-1]
+        # Get current price data from Alpaca for all symbols at once
+        try:
+            request_params = StockBarsRequest(
+                symbol_or_symbols=self.symbols,
+                timeframe=TimeFrame.Minute, # Use minute data for current price
+                start=end_date - timedelta(minutes=15), # Get last 15 minutes to ensure we get data
+                end=end_date
+            )
+            latest_bars_obj = self.stock_data_client.get_stock_bars(request_params)
+            latest_bars = latest_bars_obj.df
+
+            for symbol in self.symbols:
+                if symbol in latest_bars.index.get_level_values('symbol'):
+                    current_price = latest_bars.loc[symbol]['close'].iloc[-1]
+                    state.append(float(current_price) / 1000.0)  # Normalize price
+                    state.append(positions[symbol] / 100.0)  # Normalize position
+                    logger.info(f"Current price for {symbol}: ${current_price:.2f}")
                 else:
                     logger.warning(f"No real-time price data for {symbol} from Alpaca, using default price.")
-                    current_price = 100.0
+                    state.append(100.0 / 1000.0)  # Default normalized price
+                    state.append(positions[symbol] / 100.0)  # Normalize position
 
-                state.append(float(current_price) / 1000.0)  # Normalize price
-                state.append(positions[symbol] / 100.0)  # Normalize position
-
-                logger.info(f"Current price for {symbol}: ${current_price:.2f}")
-
-            except Exception as e:
-                logger.error(f"Error getting price data for {symbol}: {e}")
-                # Use default values
+        except Exception as e:
+            logger.error(f"Error getting current price data for all symbols: {e}")
+            for symbol in self.symbols:
                 state.append(100.0 / 1000.0)  # Default normalized price
                 state.append(positions[symbol] / 100.0)  # Normalize position
 
@@ -1027,6 +1045,7 @@ class AlpacaTradingSystem:
                     end=end_date
                 )
                 hist_data = self.stock_data_client.get_stock_bars(request_params).df
+                time.sleep(5)
 
                 if not hist_data.empty and len(hist_data) >= LOOKBACK_WINDOW:
                     prices = hist_data["close"].values[-LOOKBACK_WINDOW:]
@@ -1093,6 +1112,7 @@ class AlpacaTradingSystem:
                             end=datetime.now()
                         )
                         bars = self.stock_data_client.get_stock_bars(request_params).df
+                        time.sleep(5)  # Throttle requests to avoid hitting API limits
                         if not bars.empty:
                             current_price = bars["close"].iloc[-1]
                             logger.info(f"Latest price for {symbol}: ${current_price:.2f}")
