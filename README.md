@@ -21,7 +21,7 @@ This is a sophisticated stock trading bot that uses a Deep Reinforcement Learnin
 
 The bot operates based on the interaction between a DRL agent and a simulated stock market environment.
 
-1.  **Data Collection:** The `StockTradingEnvironment` downloads historical stock data for the symbols defined in `stocks.json` using the `yfinance` library, with parallel fetching and robust error handling.
+1.  **Data Collection:** The `StockTradingEnvironment` downloads historical stock data for the symbols defined in `stocks.json` using the `alpaca-py` library, with parallel fetching and robust error handling. `yfinance` is used as a fallback if Alpaca data is unavailable.
 2.  **Training:** In `train` mode, the `DRLAgent` is trained on the historical data. It learns to maximize its rewards (i.e., portfolio value) by making decisions in the simulated environment. The agent's "brain" consists of two neural networks:
     *   An **Actor Network** that decides the action to take (buy, sell, or hold).
     *   A **Critic Network** that evaluates the quality of the actor's actions.

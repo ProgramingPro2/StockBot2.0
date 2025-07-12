@@ -43,9 +43,9 @@ run_live_mode() {
 
 # Function to run script in training mode
 run_training_mode() {
-	log "Running main.py in TRAINING mode with 25000 epochs"
+	log "Running main.py in TRAINING mode with 2500 epochs"
 	cd "$SCRIPT_DIR"
-	nohup "$PYTHON_ENV/bin/python" "$MAIN_SCRIPT" --mode train --gpu --epochs 25000 >"$LOG_DIR/training_$CURRENT_DATE.log" 2>&1 &
+	nohup "$PYTHON_ENV/bin/python" "$MAIN_SCRIPT" --mode train --gpu --epochs 2500 >"$LOG_DIR/training_$CURRENT_DATE.log" 2>&1 &
 	log "Training mode started with PID: $!"
 }
 

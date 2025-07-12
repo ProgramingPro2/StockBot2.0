@@ -18,6 +18,7 @@ from tensorflow.keras.layers import (
     BatchNormalization,
 )
 import matplotlib.pyplot as plt
+import yfinance as yf
 import dotenv
 from pathlib import Path
 import logging
@@ -112,11 +113,11 @@ STOCK_SYMBOLS = [
     "AMD",
 ]
 INITIAL_BALANCE = 1000.0
-LOOKBACK_WINDOW = 10
-TRADING_FREQUENCY = "minute"
+LOOKBACK_WINDOW = 168
+TRADING_FREQUENCY = "hourly"
 MAX_SHARES_PER_TRADE = 5
 TRAINING_EPISODES = 1000
-TEST_EPISODES = 100
+TEST_EPISODES = 10
 REWARD_SCALING_FACTOR = 1000.0
 
 if os.path.exists("stocks.json"):
@@ -899,7 +900,7 @@ class StockTradingEnvironment:
         try:
             request_params = StockBarsRequest(
                 symbol_or_symbols=symbols_to_download,
-                timeframe=TimeFrame.Day,
+                timeframe=TimeFrame.Hour,
                 start=start_date,
                 end=end_date
             )
@@ -1009,8 +1010,8 @@ class AlpacaTradingSystem:
         try:
             request_params = StockBarsRequest(
                 symbol_or_symbols=self.symbols,
-                timeframe=TimeFrame.Minute, # Use minute data for current price
-                start=end_date - timedelta(minutes=15), # Get last 15 minutes to ensure we get data
+                timeframe=TimeFrame.Hour, # Use hour data for current price
+                start=end_date - timedelta(hours=1), # Get last hour to ensure we get data
                 end=end_date
             )
             latest_bars_obj = self.stock_data_client.get_stock_bars(request_params)
@@ -1023,15 +1024,43 @@ class AlpacaTradingSystem:
                     state.append(positions[symbol] / 100.0)  # Normalize position
                     logger.info(f"Current price for {symbol}: ${current_price:.2f}")
                 else:
-                    logger.warning(f"No real-time price data for {symbol} from Alpaca, using default price.")
-                    state.append(100.0 / 1000.0)  # Default normalized price
-                    state.append(positions[symbol] / 100.0)  # Normalize position
+                    logger.warning(f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback.")
+                    try:
+                        ticker_data = yf.Ticker(symbol)
+                        current_data = ticker_data.history(period="1d", interval="1h")
+                        if not current_data.empty:
+                            current_price = current_data["Close"].iloc[-1]
+                            state.append(float(current_price) / 1000.0)  # Normalize price
+                            state.append(positions[symbol] / 100.0)  # Normalize position
+                            logger.info(f"Current price for {symbol} from yfinance: ${current_price:.2f}")
+                        else:
+                            logger.warning(f"No real-time price data for {symbol} from yfinance. Using default price.")
+                            state.append(100.0 / 1000.0)  # Default normalized price
+                            state.append(positions[symbol] / 100.0)  # Normalize position
+                    except Exception as yf_e:
+                        logger.error(f"Error getting price data for {symbol} from yfinance: {yf_e}. Using default price.")
+                        state.append(100.0 / 1000.0)  # Default normalized price
+                        state.append(positions[symbol] / 100.0)  # Normalize position
 
         except Exception as e:
-            logger.error(f"Error getting current price data for all symbols: {e}")
+            logger.error(f"Error getting current price data for all symbols from Alpaca: {e}. Attempting yfinance fallback for all.")
             for symbol in self.symbols:
-                state.append(100.0 / 1000.0)  # Default normalized price
-                state.append(positions[symbol] / 100.0)  # Normalize position
+                try:
+                    ticker_data = yf.Ticker(symbol)
+                    current_data = ticker_data.history(period="1d", interval="1h")
+                    if not current_data.empty:
+                        current_price = current_data["Close"].iloc[-1]
+                        state.append(float(current_price) / 1000.0)  # Normalize price
+                        state.append(positions[symbol] / 100.0)  # Normalize position
+                        logger.info(f"Current price for {symbol} from yfinance: ${current_price:.2f}")
+                    else:
+                        logger.warning(f"No real-time price data for {symbol} from yfinance. Using default price.")
+                        state.append(100.0 / 1000.0)  # Default normalized price
+                        state.append(positions[symbol] / 100.0)  # Normalize position
+                except Exception as yf_e:
+                    logger.error(f"Error getting price data for {symbol} from yfinance: {yf_e}. Using default price.")
+                    state.append(100.0 / 1000.0)  # Default normalized price
+                    state.append(positions[symbol] / 100.0)  # Normalize position
 
         state.append(balance / INITIAL_BALANCE)  # Normalized balance
 
@@ -1040,7 +1069,7 @@ class AlpacaTradingSystem:
             try:
                 request_params = StockBarsRequest(
                     symbol_or_symbols=[symbol],
-                    timeframe=TimeFrame.Day,
+                    timeframe=TimeFrame.Hour,
                     start=start_date,
                     end=end_date
                 )
@@ -1103,53 +1132,103 @@ class AlpacaTradingSystem:
             if signal > 0:  # Buy signal
                 shares_to_buy = int(signal * MAX_SHARES_PER_TRADE)
                 if shares_to_buy > 0:
+                    current_price = None
                     try:
-                        # Get latest price with Alpaca before placing order
+                        # Attempt to get latest price with Alpaca
                         request_params = StockBarsRequest(
                             symbol_or_symbols=[symbol],
-                            timeframe=TimeFrame.Minute,
-                            start=datetime.now() - timedelta(minutes=5),
+                            timeframe=TimeFrame.Hour,
+                            start=datetime.now() - timedelta(hours=1),
                             end=datetime.now()
                         )
                         bars = self.stock_data_client.get_stock_bars(request_params).df
-                        time.sleep(5)  # Throttle requests to avoid hitting API limits
                         if not bars.empty:
                             current_price = bars["close"].iloc[-1]
-                            logger.info(f"Latest price for {symbol}: ${current_price:.2f}")
+                            logger.info(f"Latest price for {symbol} from Alpaca: ${current_price:.2f}")
                         else:
-                            logger.warning(f"Could not get current price for {symbol}. Skipping buy order.")
-                            continue
-
-                        # Submit order
-                        market_order_data = MarketOrderRequest(
-                            symbol=symbol,
-                            qty=shares_to_buy,
-                            side=OrderSide.Buy,
-                            time_in_force=TimeInForce.Day
-                        )
-                        self.trading_client.submit_order(order_data=market_order_data)
-                        logger.info(f"BUY ORDER: {shares_to_buy} shares of {symbol}")
-                        trade_actions.append(f"BUY {symbol}: {shares_to_buy} shares")
-
+                            logger.warning(f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback.")
                     except Exception as e:
-                        logger.error(f"Buy order failed for {symbol}: {e}")
+                        logger.warning(f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback.")
+
+                    if current_price is None:
+                        try:
+                            ticker_data = yf.Ticker(symbol)
+                            current_data = ticker_data.history(period="1d", interval="1h")
+                            if not current_data.empty:
+                                current_price = current_data["Close"].iloc[-1]
+                                logger.info(f"Latest price for {symbol} from yfinance: ${current_price:.2f}")
+                            else:
+                                logger.warning(f"No real-time price data for {symbol} from yfinance. Skipping buy order.")
+                                continue # Skip to next symbol if no price data
+                        except Exception as yf_e:
+                            logger.error(f"Error getting price data for {symbol} from yfinance: {yf_e}. Skipping buy order.")
+                            continue # Skip to next symbol if no price data
+
+                    if current_price is not None and current_price > 0:
+                        try:
+                            # Submit order
+                            market_order_data = MarketOrderRequest(
+                                symbol=symbol,
+                                qty=shares_to_buy,
+                                side=OrderSide.Buy,
+                                time_in_force=TimeInForce.DAY
+                            )
+                            self.trading_client.submit_order(order_data=market_order_data)
+                            logger.info(f"BUY ORDER: {shares_to_buy} shares of {symbol}")
+                            trade_actions.append(f"BUY {symbol}: {shares_to_buy} shares")
+
+                        except Exception as e:
+                            logger.error(f"Buy order failed for {symbol}: {e}")
             elif signal < 0:  # Sell signal
                 shares_to_sell = int(-signal * min(MAX_SHARES_PER_TRADE, current_shares))
                 if shares_to_sell > 0:
+                    current_price = None
                     try:
-                        # Submit order
-                        market_order_data = MarketOrderRequest(
-                            symbol=symbol,
-                            qty=shares_to_sell,
-                            side=OrderSide.Sell,
-                            time_in_force=TimeInForce.Day
+                        # Attempt to get latest price with Alpaca
+                        request_params = StockBarsRequest(
+                            symbol_or_symbols=[symbol],
+                            timeframe=TimeFrame.Hour,
+                            start=datetime.now() - timedelta(hours=1),
+                            end=datetime.now()
                         )
-                        self.trading_client.submit_order(order_data=market_order_data)
-                        logger.info(f"SELL ORDER: {shares_to_sell} shares of {symbol}")
-                        trade_actions.append(f"SELL {symbol}: {shares_to_sell} shares")
-
+                        bars = self.stock_data_client.get_stock_bars(request_params).df
+                        if not bars.empty:
+                            current_price = bars["close"].iloc[-1]
+                            logger.info(f"Latest price for {symbol} from Alpaca: ${current_price:.2f}")
+                        else:
+                            logger.warning(f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback.")
                     except Exception as e:
-                        logger.error(f"Sell order failed for {symbol}: {e}")
+                        logger.warning(f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback.")
+
+                    if current_price is None:
+                        try:
+                            ticker_data = yf.Ticker(symbol)
+                            current_data = ticker_data.history(period="1d", interval="1h")
+                            if not current_data.empty:
+                                current_price = current_data["Close"].iloc[-1]
+                                logger.info(f"Latest price for {symbol} from yfinance: ${current_price:.2f}")
+                            else:
+                                logger.warning(f"No real-time price data for {symbol} from yfinance. Skipping sell order.")
+                                continue # Skip to next symbol if no price data
+                        except Exception as yf_e:
+                            logger.error(f"Error getting price data for {symbol} from yfinance: {yf_e}. Skipping sell order.")
+                            continue # Skip to next symbol if no price data
+
+                    if current_price is not None and current_price > 0:
+                        try:
+                            # Submit order
+                            market_order_data = MarketOrderRequest(
+                                symbol=symbol,
+                                qty=shares_to_sell,
+                                side=OrderSide.Sell,
+                                time_in_force=TimeInForce.DAY
+                            )
+                            self.trading_client.submit_order(order_data=market_order_data)
+                            logger.info(f"SELL ORDER: {shares_to_sell} shares of {symbol}")
+                            trade_actions.append(f"SELL {symbol}: {shares_to_sell} shares")
+
+                        except Exception as e:
+                            logger.error(f"Sell order failed for {symbol}: {e}")
 
         if trade_actions:
             logger.info(f"Actions taken: {', '.join(trade_actions)}")
@@ -1167,7 +1246,7 @@ class AlpacaTradingSystem:
         return actions
 
 
-def optimize_agent():
+def optimize_agent(OPTIMIZATION_ITERATIONS=40):
     """Perform hyperparameter optimization using Optuna."""
     logger.info("Starting hyperparameter optimization...")
 
@@ -1198,7 +1277,7 @@ def optimize_agent():
         agent.gamma = gamma  # Ensure agent uses the trial's gamma
 
         # Train for a reduced number of episodes for optimization speed
-        optimization_episodes = 200  # Reduced episodes for faster trials
+        optimization_episodes = 100  # Reduced episodes for faster trials
 
         for episode in tqdm(range(optimization_episodes), desc=f"Trial {trial.number} Training"): # Add tqdm here
             state = env.reset()
@@ -1218,7 +1297,7 @@ def optimize_agent():
             STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW
         )
         final_values = []
-        for _ in tqdm(range(50), desc=f"Trial {trial.number} Testing"): # Add tqdm here
+        for _ in tqdm(range(OPTIMIZATION_ITERATIONS), desc=f"Trial {trial.number} Testing"): # Add tqdm here
             state = test_env.reset()
             done = False
             while not done:
