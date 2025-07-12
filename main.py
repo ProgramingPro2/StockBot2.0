@@ -1252,14 +1252,14 @@ def optimize_agent(OPTIMIZATION_ITERATIONS=40):
 
     def objective(trial):
         # Suggest hyperparameters
-        learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
+        learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
         batch_size = trial.suggest_categorical(
             "batch_size", [256, 512, 1024, 2048, 4096]
         )
-        gamma = trial.suggest_uniform("gamma", 0.9, 0.99)
-        noise_sigma = trial.suggest_uniform("noise_sigma", 0.05, 0.3)
-        noise_theta = trial.suggest_uniform("noise_theta", 0.1, 0.5)
-        reward_scaling_factor = trial.suggest_loguniform("reward_scaling_factor", 10.0, 10000.0)
+        gamma = trial.suggest_float("gamma", 0.9, 0.99)
+        noise_sigma = trial.suggest_float("noise_sigma", 0.05, 0.3)
+        noise_theta = trial.suggest_float("noise_theta", 0.1, 0.5)
+        reward_scaling_factor = trial.suggest_float("reward_scaling_factor", 10.0, 10000.0, log=True)
 
         # Update global parameters or pass them to the agent
         global LEARNING_RATE, BATCH_SIZE, GAMMA
