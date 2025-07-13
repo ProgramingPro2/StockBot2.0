@@ -29,7 +29,19 @@ from concurrent.futures import ThreadPoolExecutor
 
 
 class OrnsteinUhlenbeckActionNoise:
+    """A class for generating Ornstein-Uhlenbeck process noise."""
+
     def __init__(self, mu, sigma=0.15, theta=0.2, dt=1e-2, x0=None):
+        """
+        Initializes the OrnsteinUhlenbeckActionNoise.
+
+        Args:
+            mu: The mean of the noise.
+            sigma: The volatility of the noise.
+            theta: The rate of mean reversion.
+            dt: The time step.
+            x0: The initial value of the noise.
+        """
         self.theta = theta
         self.mu = mu
         self.sigma = sigma
@@ -38,6 +50,12 @@ class OrnsteinUhlenbeckActionNoise:
         self.reset()
 
     def __call__(self):
+        """
+        Generates the next noise value.
+
+        Returns:
+            The next noise value.
+        """
         x = (
             self.x_prev
             + self.theta * (self.mu - self.x_prev) * self.dt
@@ -47,8 +65,8 @@ class OrnsteinUhlenbeckActionNoise:
         return x
 
     def reset(self):
+        """Resets the noise to its initial state."""
         self.x_prev = self.x0 if self.x0 is not None else np.zeros_like(self.mu)
-
 
 
 # Configure logging
@@ -84,8 +102,6 @@ else:
 tf.config.run_functions_eagerly(False)
 
 tf.config.optimizer.set_jit(True)  # Enable XLA JIT compilation
-tf.config.threading.set_inter_op_parallelism_threads(8)  # Number of P-cores
-tf.config.threading.set_intra_op_parallelism_threads(8)  # Number of P-cores
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -96,7 +112,9 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_PAPER_TRADING = os.getenv("ALPACA_PAPER_TRADING", "True").lower() == "true"
 
 # Connect to Alpaca API
-trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER_TRADING)
+trading_client = TradingClient(
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER_TRADING
+)
 stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
 # Configuration parameters
@@ -159,7 +177,9 @@ if hyperparams_path.exists():
             GAMMA = optimized_params.get("gamma", GAMMA)
             NOISE_SIGMA = optimized_params.get("noise_sigma", NOISE_SIGMA)
             NOISE_THETA = optimized_params.get("noise_theta", NOISE_THETA)
-            REWARD_SCALING_FACTOR = optimized_params.get("reward_scaling_factor", REWARD_SCALING_FACTOR)
+            REWARD_SCALING_FACTOR = optimized_params.get(
+                "reward_scaling_factor", REWARD_SCALING_FACTOR
+            )
             logger.info(f"Loaded optimized hyperparameters from {hyperparams_path}")
             logger.info(f"  LEARNING_RATE: {LEARNING_RATE}")
             logger.info(f"  BATCH_SIZE: {BATCH_SIZE}")
@@ -176,7 +196,17 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 
 class ReplayBuffer:
+    """A class for storing and retrieving experiences for training a reinforcement learning agent."""
+
     def __init__(self, capacity, state_dim, action_dim):
+        """
+        Initializes the ReplayBuffer.
+
+        Args:
+            capacity: The maximum number of experiences to store.
+            state_dim: The dimension of the state space.
+            action_dim: The dimension of the action space.
+        """
         self.capacity = capacity
         self.position = 0
         self.size = 0
@@ -189,6 +219,16 @@ class ReplayBuffer:
         self.dones = np.zeros(capacity, dtype=np.float32)
 
     def push(self, state, action, reward, next_state, done):
+        """
+        Stores an experience in the replay buffer.
+
+        Args:
+            state: The current state.
+            action: The action taken.
+            reward: The reward received.
+            next_state: The next state.
+            done: Whether the episode is done.
+        """
         # Direct assignment to pre-allocated arrays
         self.states[self.position] = state
         self.actions[self.position] = action
@@ -200,20 +240,36 @@ class ReplayBuffer:
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size):
-        # Generate random indices - much faster than random.choice
-        indices = np.random.randint(0, self.size, batch_size)
+    def as_dataset(self, batch_size):
+        """Creates a tf.data.Dataset from the replay buffer."""
+        if self.size == 0:
+            return None
 
-        # Return slices of the arrays for better performance
-        return (
-            self.states[indices],
-            self.actions[indices],
-            self.rewards[indices],
-            self.next_states[indices],
-            self.dones[indices],
+        # Create a dataset from the stored transitions
+        dataset = tf.data.Dataset.from_tensor_slices(
+            (
+                self.states[: self.size],
+                self.actions[: self.size],
+                self.rewards[: self.size],
+                self.next_states[: self.size],
+                self.dones[: self.size],
+            )
         )
 
+        # Shuffle, repeat, and batch the data
+        dataset = (
+            dataset.shuffle(buffer_size=self.size, reshuffle_each_iteration=True)
+            .repeat()
+            .batch(batch_size)
+        )
+
+        # Prefetch data to the GPU
+        dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+        return dataset
+
     def __len__(self):
+        """Returns the current size of the replay buffer."""
         return self.size
 
     def save(self, path):
@@ -293,7 +349,26 @@ class ReplayBuffer:
 
 
 class DRLAgent:
-    def __init__(self, state_dim, action_dim, learning_rate=LEARNING_RATE, noise_sigma=NOISE_SIGMA, noise_theta=NOISE_THETA):
+    """A Deep Reinforcement Learning Agent using Actor-Critic architecture."""
+
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        learning_rate=LEARNING_RATE,
+        noise_sigma=NOISE_SIGMA,
+        noise_theta=NOISE_THETA,
+    ):
+        """
+        Initializes the DRLAgent.
+
+        Args:
+            state_dim: The dimension of the state space.
+            action_dim: The dimension of the action space.
+            learning_rate: The learning rate for the optimizers.
+            noise_sigma: The sigma parameter for the Ornstein-Uhlenbeck noise.
+            noise_theta: The theta parameter for the Ornstein-Uhlenbeck noise.
+        """
         self.state_dim = state_dim
         self.action_dim = action_dim
 
@@ -305,7 +380,9 @@ class DRLAgent:
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
         self.learning_rate = learning_rate
-        self.noise = OrnsteinUhlenbeckActionNoise(mu=np.zeros(action_dim), sigma=noise_sigma, theta=noise_theta)
+        self.noise = OrnsteinUhlenbeckActionNoise(
+            mu=np.zeros(action_dim), sigma=noise_sigma, theta=noise_theta
+        )
 
         # Set default TensorFlow dtype to float32 explicitly
         tf.keras.backend.set_floatx("float32")
@@ -347,7 +424,7 @@ class DRLAgent:
         )
 
     def _build_actor(self):
-        """Build policy network (actor) that selects actions with GPU optimizations"""
+        """Build policy network (actor) that selects actions with GPU optimizations."""
         model = Sequential(
             [
                 # Use CuDNN-optimized layers when running on GPU
@@ -380,7 +457,7 @@ class DRLAgent:
         return model
 
     def _build_critic(self):
-        """Build value network (critic) that estimates Q-values with GPU optimizations"""
+        """Build value network (critic) that estimates Q-values with GPU optimizations."""
         state_input = Input(shape=(self.state_dim,))
         action_input = Input(shape=(self.action_dim,))
 
@@ -421,7 +498,15 @@ class DRLAgent:
 
     @tf.function
     def _actor_train_step(self, states):
-        """TensorFlow function for actor training step"""
+        """
+        Performs a single training step for the actor network.
+
+        Args:
+            states: A TensorFlow tensor representing the current states.
+
+        Returns:
+            The actor loss as a TensorFlow scalar.
+        """
         with tf.GradientTape() as tape:
             actions_pred = self.actor(states, training=True)
             actor_loss = -tf.reduce_mean(
@@ -438,7 +523,17 @@ class DRLAgent:
 
     @tf.function
     def _critic_train_step(self, states, actions, q_targets):
-        """TensorFlow function for critic training step"""
+        """
+        Performs a single training step for the critic network.
+
+        Args:
+            states: A TensorFlow tensor representing the current states.
+            actions: A TensorFlow tensor representing the actions taken.
+            q_targets: A TensorFlow tensor representing the target Q-values.
+
+        Returns:
+            The critic loss as a TensorFlow scalar.
+        """
         with tf.GradientTape() as tape:
             q_values = self.critic([states, actions], training=True)
             # Ensure q_values is float32 for calculation with q_targets
@@ -454,7 +549,16 @@ class DRLAgent:
         return critic_loss
 
     def act(self, state, explore=True):
-        """Choose an action based on the current state"""
+        """
+        Chooses an action based on the current state.
+
+        Args:
+            state: The current state of the environment.
+            explore: A boolean indicating whether to add exploration noise.
+
+        Returns:
+            An array representing the chosen action.
+        """
         if explore and np.random.rand() <= self.epsilon:
             # Exploration: random actions
             return np.random.uniform(-1, 1, self.action_dim)
@@ -470,49 +574,55 @@ class DRLAgent:
         return action_output
 
     def remember(self, state, action, reward, next_state, done):
-        """Store experience in replay memory"""
+        """Stores an experience in the replay memory."""
         self.memory.push(state, action, reward, next_state, done)
 
-    def train(self):
-        """Train the agent using experiences from memory with GPU optimizations"""
-        if len(self.memory) < BATCH_SIZE:
+    def train(self, dataset):
+        """
+        Trains the agent using a batch from the dataset.
+
+        Args:
+            dataset: A tf.data.Dataset iterator providing batches of experiences.
+
+        Returns:
+            A dictionary containing the critic and actor losses.
+        """
+        if dataset is None:
             return
 
-        # Sample a larger batch for better GPU utilization
-        states, actions, rewards, next_states, dones = self.memory.sample(BATCH_SIZE)
+        # Get the next batch from the dataset iterator
+        states, actions, rewards, next_states, dones = next(dataset)
 
-        # Convert to tensors with proper GPU-friendly types, explicitly specifying float32
-        states_tensor = tf.convert_to_tensor(states, dtype=tf.float32)
-        actions_tensor = tf.convert_to_tensor(actions, dtype=tf.float32)
-        rewards_tensor = tf.convert_to_tensor(rewards, dtype=tf.float32)
-        next_states_tensor = tf.convert_to_tensor(next_states, dtype=tf.float32)
-        dones_tensor = tf.convert_to_tensor(dones, dtype=tf.float32)
+        # Ensure tensors have the correct data type
+        states = tf.cast(states, tf.float32)
+        actions = tf.cast(actions, tf.float32)
+        rewards = tf.cast(rewards, tf.float32)
+        next_states = tf.cast(next_states, tf.float32)
+        dones = tf.cast(dones, tf.float32)
 
-        # Calculate target Q-values using target models for stability
-        # This calculation can be done in a single batched operation for speed
-        next_actions = self.target_actor(next_states_tensor, training=False)
-        q_next = self.target_critic([next_states_tensor, next_actions], training=False)
-        # Ensure q_next is float32 for calculation with gamma and rewards_tensor
-        q_next_float32 = tf.cast(q_next, tf.float32)
-        q_targets = rewards_tensor + (1 - dones_tensor) * self.gamma * q_next_float32[:, 0]
+        # Calculate target Q-values
+        next_actions = self.target_actor(next_states, training=False)
+        q_next = self.target_critic([next_states, next_actions], training=False)
+        q_next = tf.cast(q_next, tf.float32)
+        q_targets = rewards + (1 - dones) * self.gamma * q_next[:, 0]
 
-        # Run critic and actor training with optimized GPU functions
+        # Train critic and actor
         critic_loss = self._critic_train_step(
-            states_tensor, actions_tensor, tf.expand_dims(q_targets, axis=1)
+            states, actions, tf.expand_dims(q_targets, axis=1)
         )
-        actor_loss = self._actor_train_step(states_tensor)
+        actor_loss = self._actor_train_step(states)
 
         # Decay epsilon
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
-        # Perform soft target updates
+        # Soft update target networks
         self._update_target_networks()
 
         return {"critic_loss": critic_loss.numpy(), "actor_loss": actor_loss.numpy()}
 
     def _update_target_networks(self, tau=0.005):
-        """Soft update target networks"""
+        """Soft updates the target actor and critic networks."""
         for target_param, param in zip(
             self.target_actor.variables, self.actor.variables
         ):
@@ -524,7 +634,12 @@ class DRLAgent:
             target_param.assign(param * tau + target_param * (1 - tau))
 
     def save_models(self, path=None):
-        """Save actor and critic models using TensorFlow checkpoints and .keras format"""
+        """
+        Saves the actor and critic models using TensorFlow checkpoints and .keras format.
+
+        Args:
+            path: The directory to save the .keras models. If None, only checkpoints are saved.
+        """
         # Use .keras format for path-based saving (recommended)
         if path:
             Path(path).mkdir(exist_ok=True)  # Ensure directory exists
@@ -557,7 +672,15 @@ class DRLAgent:
         return actor_path, critic_path
 
     def load_models(self, path=None):
-        """Load models, prioritizing checkpoints, then .keras files."""
+        """
+        Loads the actor and critic models, prioritizing checkpoints, then .keras files.
+
+        Args:
+            path: The directory to load the .keras models from. If None, only checkpoints are attempted.
+
+        Returns:
+            True if models were successfully loaded, False otherwise.
+        """
         checkpoint_loaded = False
         # --- Attempt 1: Load from Checkpoints ---
         if (
@@ -638,9 +761,7 @@ class DRLAgent:
                         f"Failed to load models from .keras files in {path}: {e}. Trying H5 fallback..."
                     )
             else:
-                logger.info(
-                    f".keras models not found in {path}."
-                )
+                logger.info(f".keras models not found in {path}.")
 
         # --- Failed to load ---
         logger.error("Failed to load models from checkpoints or specified path.")
@@ -648,10 +769,20 @@ class DRLAgent:
 
 
 class StockTradingEnvironment:
+    """A simulated stock trading environment for training and testing reinforcement learning agents."""
+
     # Class-level cache for stock data across all instances
     _global_data_cache = {}
 
     def __init__(self, symbols, initial_balance, lookback_window):
+        """
+        Initializes the StockTradingEnvironment.
+
+        Args:
+            symbols: A list of stock symbols to trade.
+            initial_balance: The initial cash balance for the trading account.
+            lookback_window: The number of historical data points to consider for the state.
+        """
         self.symbols = symbols
         self.initial_balance = initial_balance
         self.lookback_window = lookback_window
@@ -664,18 +795,25 @@ class StockTradingEnvironment:
         self.state_size = (
             (len(self.symbols) * 2) + 1 + (len(self.symbols) * self.lookback_window)
         )
+        self.shares = {symbol: 0 for symbol in self.symbols}
         self.reset()
 
     def reset(self):
-        """Reset the environment for new episode"""
+        """Resets the environment to its initial state for a new episode.
+
+        Returns:
+            The initial state of the environment.
+        """
         self.balance = self.initial_balance
         # Use numpy arrays for shares for vectorized operations
-        self.shares = {symbol: 0 for symbol in self.symbols}
         self.data = self._get_data()
+        self.prefetched_data = self.prefetch_data()
 
         # Ensure we have enough data for lookback window - use numpy for efficiency
-        data_lengths = np.array([len(self.data[symbol]) for symbol in self.symbols])
-        min_data_length = np.min(data_lengths)
+        data_lengths = np.array(
+            [len(self.prefetched_data[symbol]) for symbol in self.symbols]
+        )
+        min_data_length = np.min(data_lengths) if data_lengths.size > 0 else 0
 
         # Set current step to lookback_window or to data length if not enough data
         self.current_step = min(self.lookback_window, min_data_length - 1)
@@ -694,57 +832,31 @@ class StockTradingEnvironment:
         return self._get_state()
 
     def _update_current_prices(self):
-        """Cache current prices for all symbols to avoid repeated lookups"""
-        self.current_prices = {}
-        for symbol in self.symbols:
-            try:
-                current_price = self.data[symbol]["Close"].iloc[self.current_step]
-
-                # Convert to scalar if necessary
-                if isinstance(current_price, pd.Series):
-                    current_price = (
-                        current_price.iloc[0] if len(current_price) > 0 else 0.0
-                    )
-                elif (
-                    hasattr(current_price, "item")
-                    and hasattr(current_price, "size")
-                    and current_price.size == 1
-                ):
-                    current_price = current_price.item()
-                elif hasattr(current_price, "shape") and len(current_price.shape) > 0:
-                    current_price = current_price[0] if current_price.size > 0 else 0.0
-
-                self.current_prices[symbol] = float(current_price)
-            except Exception as e:
-                logger.error(f"Error updating current price for {symbol}: {e}")
-                self.current_prices[symbol] = 100.0  # Default price
+        """Caches the current prices for all symbols to avoid repeated lookups."""
+        self.current_prices = np.array(
+            [
+                self.prefetched_data[symbol][self.current_step]
+                for symbol in self.symbols
+            ],
+            dtype=np.float32,
+        )
 
     def _get_state(self):
-        """Create state representation with vectorized operations for better performance"""
+        """Creates the state representation with vectorized operations for better performance.
+
+        Returns:
+            A numpy array representing the current state of the environment.
+        """
         # Reuse pre-allocated array for better performance
         state = np.zeros(self.state_size, dtype=np.float32)
 
         # Current price and holdings with vectorized operations
-        for i, symbol in enumerate(self.symbols):
-            try:
-                # Use cached price
-                current_price = self.current_prices[symbol]
-
-                # Directly assign to pre-allocated array (faster)
-                state[i * 2] = (
-                    current_price / self.price_normalization
-                )  # Normalize price
-                state[i * 2 + 1] = (
-                    self.shares[symbol] / self.shares_normalization
-                )  # Normalize shares
-
-            except Exception as e:
-                logger.error(
-                    f"Error accessing price data for {symbol} at step {self.current_step}: {e}"
-                )
-                # Use default values
-                state[i * 2] = 0.0
-                state[i * 2 + 1] = 0.0
+        prices = self.current_prices / self.price_normalization
+        shares = (
+            np.array([self.shares[s] for s in self.symbols], dtype=np.float32)
+            / self.shares_normalization
+        )
+        state[: len(self.symbols) * 2] = np.column_stack((prices, shares)).flatten()
 
         # Add normalized balance
         state[len(self.symbols) * 2] = self.balance / self.initial_balance
@@ -752,65 +864,64 @@ class StockTradingEnvironment:
         # Add historical price data in a vectorized way
         lookback_start_idx = (len(self.symbols) * 2) + 1
         for i, symbol in enumerate(self.symbols):
-            try:
-                # Get historical prices for the lookback window
-                # Ensure we have enough data for the lookback window
-                if self.current_step < self.lookback_window:
-                    # If not enough data, pad with the first available price
-                    available_prices = self.data[symbol]['Close'].iloc[:self.current_step + 1].values
-                    if available_prices.ndim > 1:
-                        available_prices = available_prices.flatten()
-                    
-                    if len(available_prices) > 0:
-                        # Pad with the first available price
-                        first_price = available_prices[0]
-                        prices = np.full(self.lookback_window, first_price, dtype=np.float32)
-                        prices[self.lookback_window - len(available_prices):] = available_prices
-                    else:
-                        # If no available data, fill with default price
-                        prices = np.full(self.lookback_window, 100.0, dtype=np.float32)
-                else:
-                    prices = self.data[symbol]['Close'].iloc[self.current_step - self.lookback_window : self.current_step].values
-                    if prices.ndim > 1:
-                        prices = prices.flatten()
-                
-                # Normalize prices
-                price_max = np.max(prices) if prices.size > 0 else 1.0
-                normalized_prices = prices / max(price_max, 1e-8)
-                
-                # Assign to state array
-                state_start = lookback_start_idx + (i * self.lookback_window)
-                state_end = state_start + self.lookback_window
-                state[state_start:state_end] = normalized_prices
+            start_idx = lookback_start_idx + (i * self.lookback_window)
+            end_idx = start_idx + self.lookback_window
 
-            except Exception as e:
-                logger.error(f"Error processing price history for {symbol}: {e}")
-                # Add zeroes to maintain state vector size
-                state_start = lookback_start_idx + (i * self.lookback_window)
-                state_end = state_start + self.lookback_window
-                state[state_start:state_end] = 0.0
+            if self.current_step < self.lookback_window:
+                available_prices = self.prefetched_data[symbol][: self.current_step + 1]
+                if available_prices.size > 0:
+                    first_price = available_prices[0]
+                    prices = np.full(
+                        self.lookback_window, first_price, dtype=np.float32
+                    )
+                    prices[self.lookback_window - available_prices.size :] = (
+                        available_prices
+                    )
+                else:
+                    prices = np.full(self.lookback_window, 100.0, dtype=np.float32)
+            else:
+                prices = self.prefetched_data[symbol][
+                    self.current_step - self.lookback_window : self.current_step
+                ]
+
+            price_max = np.max(prices) if prices.size > 0 else 1.0
+            state[start_idx:end_idx] = prices / max(price_max, 1e-8)
 
         return state
 
     def _calculate_portfolio_value(self):
-        """Calculate current portfolio value"""
+        """Calculates the current portfolio value.
+
+        Returns:
+            The current total value of the portfolio (cash + assets).
+        """
         # Use the cached current prices for faster calculation
         portfolio_value = self.balance
 
         # Vectorized calculation using numpy for efficiency
-        for symbol in self.symbols:
-            portfolio_value += self.shares[symbol] * self.current_prices[symbol]
+        shares = np.array([self.shares[s] for s in self.symbols], dtype=np.float32)
+        portfolio_value += np.sum(shares * self.current_prices)
 
         return portfolio_value
 
     def step(self, action):
-        """Execute action and return new state, reward, done"""
+        """
+        Executes a trading action in the environment.
+
+        Args:
+            action: An array of continuous actions for each stock symbol.
+
+        Returns:
+            A tuple containing:
+                - next_state: The new state of the environment after the action.
+                - reward: The reward received for the action.
+                - done: A boolean indicating if the episode is finished.
+                - info: A dictionary containing additional information (e.g., portfolio value).
+        """
         # Map continuous actions to discrete buy/sell decisions
         for i, symbol in enumerate(self.symbols):
             signal = action[i]
-
-            # Use cached current price
-            current_price = self.current_prices[symbol]
+            current_price = self.current_prices[i]
 
             if signal > 0:  # Buy signal
                 shares_to_buy = int(signal * MAX_SHARES_PER_TRADE)
@@ -830,7 +941,9 @@ class StockTradingEnvironment:
         self.current_step += 1
 
         # Check if we've reached the end of our data
-        min_data_length = min(len(self.data[symbol]) for symbol in self.symbols)
+        min_data_length = min(
+            len(self.prefetched_data[symbol]) for symbol in self.symbols
+        )
         if self.current_step >= min_data_length - 1:
             self.done = True
 
@@ -843,7 +956,9 @@ class StockTradingEnvironment:
 
         # Avoid division by zero and use faster calculation
         if old_portfolio_value > 0:
-            reward = ((new_portfolio_value - old_portfolio_value) / old_portfolio_value) * REWARD_SCALING_FACTOR
+            reward = (
+                (new_portfolio_value - old_portfolio_value) / old_portfolio_value
+            ) * REWARD_SCALING_FACTOR
         else:
             reward = 0.0
 
@@ -857,106 +972,119 @@ class StockTradingEnvironment:
         )
 
     def _get_data(self):
-        """Get historical stock data for all symbols with caching using alpaca-py"""
-        # Check if we already have all the data loaded in class-level memory
+        """Gets historical stock data for all symbols with caching using alpaca-py and parallel fetching.
+
+        Returns:
+            A dictionary where keys are stock symbols and values are pandas DataFrames of historical data.
+        """
         if all(symbol in self._global_data_cache for symbol in self.symbols):
             logger.info("Using in-memory cached data for all symbols")
             return {symbol: self._global_data_cache[symbol] for symbol in self.symbols}
 
         end_date = datetime.now()
-        # Get more data to ensure we have enough for lookback
         start_date = end_date - timedelta(days=365 + self.lookback_window * 2)
-
         data = {}
-        
-        # Try to load all data from cache first
-        all_cached = True
+        symbols_to_download = []
+
         for symbol in self.symbols:
-            cache_file = CACHE_DIR / f"{symbol}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.pkl"
+            cache_file = (
+                CACHE_DIR
+                / f"{symbol}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.pkl"
+            )
             if cache_file.exists():
                 try:
                     stock_data = pd.read_pickle(cache_file)
                     data[symbol] = stock_data
                     self._global_data_cache[symbol] = stock_data
-                    logger.info(f"Loaded cached data for {symbol} from {cache_file}")
                 except Exception as e:
-                    logger.warning(f"Failed to load cached data for {symbol}: {e}. Will attempt to re-download.")
-                    all_cached = False
-                    break
+                    logger.warning(
+                        f"Failed to load cached data for {symbol}: {e}. Will re-download."
+                    )
+                    symbols_to_download.append(symbol)
             else:
-                all_cached = False
-                break
+                symbols_to_download.append(symbol)
 
-        if all_cached:
+        if not symbols_to_download:
             logger.info("All data loaded from cache.")
             return data
 
-        # If not all data is cached, download all missing data in one go
-        symbols_to_download = [s for s in self.symbols if s not in data]
-        if not symbols_to_download: # All data was loaded from cache, nothing to download
-            return data
+        logger.info(
+            f"Downloading data for {len(symbols_to_download)} symbols: {symbols_to_download}..."
+        )
 
-        logger.info(f"Downloading data for {len(symbols_to_download)} symbols: {symbols_to_download}...")
-        try:
-            request_params = StockBarsRequest(
-                symbol_or_symbols=symbols_to_download,
-                timeframe=TimeFrame.Hour,
-                start=start_date,
-                end=end_date
-            )
-            all_stock_data_obj = stock_data_client.get_stock_bars(request_params)
-            all_stock_data = all_stock_data_obj.df
-
-            for symbol in symbols_to_download:
-                if symbol in all_stock_data.index.get_level_values('symbol'):
-                    stock_data = all_stock_data.loc[symbol]
-                    # Rename columns to match yfinance output for compatibility
-                    stock_data = stock_data.rename(columns={
-                        'open': 'Open',
-                        'high': 'High',
-                        'low': 'Low',
-                        'close': 'Close',
-                        'volume': 'Volume'
-                    })
-                    # Ensure the index is just the date, not datetime
-                    stock_data.index = stock_data.index.map(lambda x: x.date())
-                    stock_data.index.name = 'Date'
-
-                    cache_file = CACHE_DIR / f"{symbol}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.pkl"
-                    stock_data.to_pickle(cache_file)
-                    data[symbol] = stock_data
-                    self._global_data_cache[symbol] = stock_data
-                    logger.info(f"Downloaded and cached {len(stock_data)} days of data for {symbol}")
-                else:
-                    logger.warning(f"No data available for {symbol} from Alpaca. Creating dummy data.")
-                    dummy_index = pd.date_range(start=start_date, end=end_date, freq="B")
-                    stock_data = pd.DataFrame(
-                        index=dummy_index,
-                        columns=["Open", "High", "Low", "Close", "Volume"],
+        def download_symbol_data(symbol):
+            try:
+                request_params = StockBarsRequest(
+                    symbol_or_symbols=[symbol],
+                    timeframe=TimeFrame.Hour,
+                    start=start_date,
+                    end=end_date,
+                )
+                stock_data_obj = stock_data_client.get_stock_bars(request_params)
+                if symbol in stock_data_obj:
+                    stock_data = stock_data_obj[symbol].df
+                    stock_data = stock_data.rename(
+                        columns={
+                            "open": "Open",
+                            "high": "High",
+                            "low": "Low",
+                            "close": "Close",
+                            "volume": "Volume",
+                        }
                     )
-                    stock_data["Close"] = 100.0  # Default price
-                    stock_data.fillna(method="ffill", inplace=True)
-                    data[symbol] = stock_data
-                    self._global_data_cache[symbol] = stock_data
+                    stock_data.index = stock_data.index.map(lambda x: x.date())
+                    stock_data.index.name = "Date"
+                    return symbol, stock_data
+                else:
+                    logger.warning(f"No data for {symbol} from Alpaca.")
+                    return symbol, None
+            except Exception as e:
+                logger.error(
+                    f"Error downloading {symbol} from Alpaca: {e}. Trying yfinance."
+                )
+                try:
+                    stock_data = yf.download(
+                        symbol, start=start_date, end=end_date, interval="1h"
+                    )
+                    if not stock_data.empty:
+                        return symbol, stock_data
+                except Exception as yf_e:
+                    logger.error(f"yfinance fallback failed for {symbol}: {yf_e}")
+                return symbol, None
 
-        except Exception as e:
-            logger.error(f"Error downloading batch data from Alpaca: {e}")
-            # Fallback to dummy data for all symbols if batch download fails
-            for symbol in symbols_to_download:
-                logger.warning(f"Creating dummy data for {symbol} due to batch download failure.")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = list(executor.map(download_symbol_data, symbols_to_download))
+
+        for symbol, stock_data in results:
+            if stock_data is not None and not stock_data.empty:
+                cache_file = (
+                    CACHE_DIR
+                    / f"{symbol}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.pkl"
+                )
+                stock_data.to_pickle(cache_file)
+                data[symbol] = stock_data
+                self._global_data_cache[symbol] = stock_data
+                logger.info(f"Downloaded and cached data for {symbol}")
+            else:
+                logger.warning(f"No data for {symbol}. Creating dummy data.")
                 dummy_index = pd.date_range(start=start_date, end=end_date, freq="B")
-                stock_data = pd.DataFrame(
+                dummy_data = pd.DataFrame(
                     index=dummy_index,
                     columns=["Open", "High", "Low", "Close", "Volume"],
                 )
-                stock_data["Close"] = 100.0  # Default price
-                data[symbol] = stock_data
-                self._global_data_cache[symbol] = stock_data
+                dummy_data["Close"] = 100.0
+                dummy_data.fillna(method="ffill", inplace=True)
+                data[symbol] = dummy_data
+                self._global_data_cache[symbol] = dummy_data
 
         return data
 
     def prefetch_data(self):
-        """Prefetch data to memory for faster training (CPU-optimized version)"""
+        """Prefetches data to memory for faster training (CPU-optimized version).
+
+        Returns:
+            A dictionary where keys are stock symbols and values are numpy arrays of close prices.
+        """
         # Convert and cache frequently accessed data for faster access
         prefetched_data = {}
         for symbol in self.symbols:
@@ -969,19 +1097,36 @@ class StockTradingEnvironment:
                 prefetched_data[symbol] = close_prices
             except Exception as e:
                 logger.error(f"Error prefetching data for {symbol}: {e}")
+                # Create dummy data if prefetching fails
+                prefetched_data[symbol] = np.full(
+                    1000, 100.0, dtype=np.float32
+                )  # Assuming a default length
 
         return prefetched_data
 
 
 class AlpacaTradingSystem:
+    """A class for executing live trades using the Alpaca API based on agent's decisions."""
+
     def __init__(self, agent, symbols):
+        """
+        Initializes the AlpacaTradingSystem.
+
+        Args:
+            agent: The DRL agent responsible for making trading decisions.
+            symbols: A list of stock symbols to trade.
+        """
         self.agent = agent
         self.symbols = symbols
         self.trading_client = trading_client
         self.stock_data_client = stock_data_client
 
     def _get_current_state(self):
-        """Create the current state based on market data and account info using Alpaca API"""
+        """Creates the current state based on market data and account information using Alpaca API.
+
+        Returns:
+            A numpy array representing the current state for the agent.
+        """
         state = []
 
         # Get account information from Alpaca
@@ -1010,40 +1155,57 @@ class AlpacaTradingSystem:
         try:
             request_params = StockBarsRequest(
                 symbol_or_symbols=self.symbols,
-                timeframe=TimeFrame.Hour, # Use hour data for current price
-                start=end_date - timedelta(hours=1), # Get last hour to ensure we get data
-                end=end_date
+                timeframe=TimeFrame.Hour,  # Use hour data for current price
+                start=end_date
+                - timedelta(hours=1),  # Get last hour to ensure we get data
+                end=end_date,
             )
             latest_bars_obj = self.stock_data_client.get_stock_bars(request_params)
             latest_bars = latest_bars_obj.df
 
             for symbol in self.symbols:
-                if symbol in latest_bars.index.get_level_values('symbol'):
-                    current_price = latest_bars.loc[symbol]['close'].iloc[-1]
+                if symbol in latest_bars.index.get_level_values("symbol"):
+                    current_price = latest_bars.loc[symbol]["close"].iloc[-1]
                     state.append(float(current_price) / 1000.0)  # Normalize price
                     state.append(positions[symbol] / 100.0)  # Normalize position
                     logger.info(f"Current price for {symbol}: ${current_price:.2f}")
                 else:
-                    logger.warning(f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback.")
+                    logger.warning(
+                        f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback."
+                    )
                     try:
                         ticker_data = yf.Ticker(symbol)
                         current_data = ticker_data.history(period="1d", interval="1h")
                         if not current_data.empty:
                             current_price = current_data["Close"].iloc[-1]
-                            state.append(float(current_price) / 1000.0)  # Normalize price
-                            state.append(positions[symbol] / 100.0)  # Normalize position
-                            logger.info(f"Current price for {symbol} from yfinance: ${current_price:.2f}")
+                            state.append(
+                                float(current_price) / 1000.0
+                            )  # Normalize price
+                            state.append(
+                                positions[symbol] / 100.0
+                            )  # Normalize position
+                            logger.info(
+                                f"Current price for {symbol} from yfinance: ${current_price:.2f}"
+                            )
                         else:
-                            logger.warning(f"No real-time price data for {symbol} from yfinance. Using default price.")
+                            logger.warning(
+                                f"No real-time price data for {symbol} from yfinance. Using default price."
+                            )
                             state.append(100.0 / 1000.0)  # Default normalized price
-                            state.append(positions[symbol] / 100.0)  # Normalize position
+                            state.append(
+                                positions[symbol] / 100.0
+                            )  # Normalize position
                     except Exception as yf_e:
-                        logger.error(f"Error getting price data for {symbol} from yfinance: {yf_e}. Using default price.")
+                        logger.error(
+                            f"Error getting price data for {symbol} from yfinance: {yf_e}. Using default price."
+                        )
                         state.append(100.0 / 1000.0)  # Default normalized price
                         state.append(positions[symbol] / 100.0)  # Normalize position
 
         except Exception as e:
-            logger.error(f"Error getting current price data for all symbols from Alpaca: {e}. Attempting yfinance fallback for all.")
+            logger.error(
+                f"Error getting current price data for all symbols from Alpaca: {e}. Attempting yfinance fallback for all."
+            )
             for symbol in self.symbols:
                 try:
                     ticker_data = yf.Ticker(symbol)
@@ -1052,13 +1214,19 @@ class AlpacaTradingSystem:
                         current_price = current_data["Close"].iloc[-1]
                         state.append(float(current_price) / 1000.0)  # Normalize price
                         state.append(positions[symbol] / 100.0)  # Normalize position
-                        logger.info(f"Current price for {symbol} from yfinance: ${current_price:.2f}")
+                        logger.info(
+                            f"Current price for {symbol} from yfinance: ${current_price:.2f}"
+                        )
                     else:
-                        logger.warning(f"No real-time price data for {symbol} from yfinance. Using default price.")
+                        logger.warning(
+                            f"No real-time price data for {symbol} from yfinance. Using default price."
+                        )
                         state.append(100.0 / 1000.0)  # Default normalized price
                         state.append(positions[symbol] / 100.0)  # Normalize position
                 except Exception as yf_e:
-                    logger.error(f"Error getting price data for {symbol} from yfinance: {yf_e}. Using default price.")
+                    logger.error(
+                        f"Error getting price data for {symbol} from yfinance: {yf_e}. Using default price."
+                    )
                     state.append(100.0 / 1000.0)  # Default normalized price
                     state.append(positions[symbol] / 100.0)  # Normalize position
 
@@ -1071,19 +1239,24 @@ class AlpacaTradingSystem:
                     symbol_or_symbols=[symbol],
                     timeframe=TimeFrame.Hour,
                     start=start_date,
-                    end=end_date
+                    end=end_date,
                 )
                 hist_data = self.stock_data_client.get_stock_bars(request_params).df
-                time.sleep(5)
 
                 if not hist_data.empty and len(hist_data) >= LOOKBACK_WINDOW:
                     prices = hist_data["close"].values[-LOOKBACK_WINDOW:]
                 else:
-                    logger.warning(f"Not enough history for {symbol}. Using available data.")
+                    logger.warning(
+                        f"Not enough history for {symbol}. Using available data."
+                    )
                     if not hist_data.empty:
                         available_prices = hist_data["close"].values
-                        first_value = available_prices[0] if len(available_prices) > 0 else 100.0
-                        padding = np.full(LOOKBACK_WINDOW - len(available_prices), first_value)
+                        first_value = (
+                            available_prices[0] if len(available_prices) > 0 else 100.0
+                        )
+                        padding = np.full(
+                            LOOKBACK_WINDOW - len(available_prices), first_value
+                        )
                         prices = np.concatenate([padding, available_prices])
                     else:
                         prices = np.full(LOOKBACK_WINDOW, 100.0)  # Default price
@@ -1102,7 +1275,11 @@ class AlpacaTradingSystem:
         return np.array(state, dtype=np.float32)
 
     def execute_trades(self):
-        """Execute trades based on agent's decisions while avoiding wash trades"""
+        """Executes trades based on the agent's decisions while avoiding wash trades.
+
+        Returns:
+            A list of actions taken (buy/sell signals) for each symbol.
+        """
         # Get current state
         state = self._get_current_state()
 
@@ -1139,30 +1316,44 @@ class AlpacaTradingSystem:
                             symbol_or_symbols=[symbol],
                             timeframe=TimeFrame.Hour,
                             start=datetime.now() - timedelta(hours=1),
-                            end=datetime.now()
+                            end=datetime.now(),
                         )
                         bars = self.stock_data_client.get_stock_bars(request_params).df
                         if not bars.empty:
                             current_price = bars["close"].iloc[-1]
-                            logger.info(f"Latest price for {symbol} from Alpaca: ${current_price:.2f}")
+                            logger.info(
+                                f"Latest price for {symbol} from Alpaca: ${current_price:.2f}"
+                            )
                         else:
-                            logger.warning(f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback.")
+                            logger.warning(
+                                f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback."
+                            )
                     except Exception as e:
-                        logger.warning(f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback.")
+                        logger.warning(
+                            f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback."
+                        )
 
                     if current_price is None:
                         try:
                             ticker_data = yf.Ticker(symbol)
-                            current_data = ticker_data.history(period="1d", interval="1h")
+                            current_data = ticker_data.history(
+                                period="1d", interval="1h"
+                            )
                             if not current_data.empty:
                                 current_price = current_data["Close"].iloc[-1]
-                                logger.info(f"Latest price for {symbol} from yfinance: ${current_price:.2f}")
+                                logger.info(
+                                    f"Latest price for {symbol} from yfinance: ${current_price:.2f}"
+                                )
                             else:
-                                logger.warning(f"No real-time price data for {symbol} from yfinance. Skipping buy order.")
-                                continue # Skip to next symbol if no price data
+                                logger.warning(
+                                    f"No real-time price data for {symbol} from yfinance. Skipping buy order."
+                                )
+                                continue  # Skip to next symbol if no price data
                         except Exception as yf_e:
-                            logger.error(f"Error getting price data for {symbol} from yfinance: {yf_e}. Skipping buy order.")
-                            continue # Skip to next symbol if no price data
+                            logger.error(
+                                f"Error getting price data for {symbol} from yfinance: {yf_e}. Skipping buy order."
+                            )
+                            continue  # Skip to next symbol if no price data
 
                     if current_price is not None and current_price > 0:
                         try:
@@ -1171,16 +1362,24 @@ class AlpacaTradingSystem:
                                 symbol=symbol,
                                 qty=shares_to_buy,
                                 side=OrderSide.Buy,
-                                time_in_force=TimeInForce.DAY
+                                time_in_force=TimeInForce.DAY,
                             )
-                            self.trading_client.submit_order(order_data=market_order_data)
-                            logger.info(f"BUY ORDER: {shares_to_buy} shares of {symbol}")
-                            trade_actions.append(f"BUY {symbol}: {shares_to_buy} shares")
+                            self.trading_client.submit_order(
+                                order_data=market_order_data
+                            )
+                            logger.info(
+                                f"BUY ORDER: {shares_to_buy} shares of {symbol}"
+                            )
+                            trade_actions.append(
+                                f"BUY {symbol}: {shares_to_buy} shares"
+                            )
 
                         except Exception as e:
                             logger.error(f"Buy order failed for {symbol}: {e}")
             elif signal < 0:  # Sell signal
-                shares_to_sell = int(-signal * min(MAX_SHARES_PER_TRADE, current_shares))
+                shares_to_sell = int(
+                    -signal * min(MAX_SHARES_PER_TRADE, current_shares)
+                )
                 if shares_to_sell > 0:
                     current_price = None
                     try:
@@ -1189,30 +1388,44 @@ class AlpacaTradingSystem:
                             symbol_or_symbols=[symbol],
                             timeframe=TimeFrame.Hour,
                             start=datetime.now() - timedelta(hours=1),
-                            end=datetime.now()
+                            end=datetime.now(),
                         )
                         bars = self.stock_data_client.get_stock_bars(request_params).df
                         if not bars.empty:
                             current_price = bars["close"].iloc[-1]
-                            logger.info(f"Latest price for {symbol} from Alpaca: ${current_price:.2f}")
+                            logger.info(
+                                f"Latest price for {symbol} from Alpaca: ${current_price:.2f}"
+                            )
                         else:
-                            logger.warning(f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback.")
+                            logger.warning(
+                                f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback."
+                            )
                     except Exception as e:
-                        logger.warning(f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback.")
+                        logger.warning(
+                            f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback."
+                        )
 
                     if current_price is None:
                         try:
                             ticker_data = yf.Ticker(symbol)
-                            current_data = ticker_data.history(period="1d", interval="1h")
+                            current_data = ticker_data.history(
+                                period="1d", interval="1h"
+                            )
                             if not current_data.empty:
                                 current_price = current_data["Close"].iloc[-1]
-                                logger.info(f"Latest price for {symbol} from yfinance: ${current_price:.2f}")
+                                logger.info(
+                                    f"Latest price for {symbol} from yfinance: ${current_price:.2f}"
+                                )
                             else:
-                                logger.warning(f"No real-time price data for {symbol} from yfinance. Skipping sell order.")
-                                continue # Skip to next symbol if no price data
+                                logger.warning(
+                                    f"No real-time price data for {symbol} from yfinance. Skipping sell order."
+                                )
+                                continue  # Skip to next symbol if no price data
                         except Exception as yf_e:
-                            logger.error(f"Error getting price data for {symbol} from yfinance: {yf_e}. Skipping sell order.")
-                            continue # Skip to next symbol if no price data
+                            logger.error(
+                                f"Error getting price data for {symbol} from yfinance: {yf_e}. Skipping sell order."
+                            )
+                            continue  # Skip to next symbol if no price data
 
                     if current_price is not None and current_price > 0:
                         try:
@@ -1221,33 +1434,30 @@ class AlpacaTradingSystem:
                                 symbol=symbol,
                                 qty=shares_to_sell,
                                 side=OrderSide.Sell,
-                                time_in_force=TimeInForce.DAY
+                                time_in_force=TimeInForce.DAY,
                             )
-                            self.trading_client.submit_order(order_data=market_order_data)
-                            logger.info(f"SELL ORDER: {shares_to_sell} shares of {symbol}")
-                            trade_actions.append(f"SELL {symbol}: {shares_to_sell} shares")
+                            self.trading_client.submit_order(
+                                order_data=market_order_data
+                            )
+                            logger.info(
+                                f"SELL ORDER: {shares_to_sell} shares of {symbol}"
+                            )
+                            trade_actions.append(
+                                f"SELL {symbol}: {shares_to_sell} shares"
+                            )
 
                         except Exception as e:
                             logger.error(f"Sell order failed for {symbol}: {e}")
 
-        if trade_actions:
-            logger.info(f"Actions taken: {', '.join(trade_actions)}")
-        else:
-            logger.info("No significant trading actions taken")
 
-        # Get updated portfolio value
-        try:
-            account = self.trading_client.get_account()
-            equity = float(account.equity)
-            logger.info(f"Current Portfolio Value: ${equity:.2f}")
-        except Exception as e:
-            logger.error(f"Failed to get account info: {e}")
+def optimize_agent(optimization_episodes=100, optimization_test_trials=5):
+    """
+    Performs hyperparameter optimization using Optuna.
 
-        return actions
-
-
-def optimize_agent(OPTIMIZATION_ITERATIONS=40):
-    """Perform hyperparameter optimization using Optuna."""
+    Args:
+        optimization_episodes: Number of episodes to train the agent for during each trial.
+        optimization_test_trials: Number of trials to test the agent for during each optimization.
+    """
     logger.info("Starting hyperparameter optimization...")
 
     def objective(trial):
@@ -1259,7 +1469,9 @@ def optimize_agent(OPTIMIZATION_ITERATIONS=40):
         gamma = trial.suggest_float("gamma", 0.9, 0.99)
         noise_sigma = trial.suggest_float("noise_sigma", 0.05, 0.3)
         noise_theta = trial.suggest_float("noise_theta", 0.1, 0.5)
-        reward_scaling_factor = trial.suggest_float("reward_scaling_factor", 10.0, 10000.0, log=True)
+        reward_scaling_factor = trial.suggest_float(
+            "reward_scaling_factor", 10.0, 10000.0, log=True
+        )
 
         # Update global parameters or pass them to the agent
         global LEARNING_RATE, BATCH_SIZE, GAMMA
@@ -1273,13 +1485,20 @@ def optimize_agent(OPTIMIZATION_ITERATIONS=40):
 
         # Train the agent with suggested hyperparameters
         env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
-        agent = DRLAgent(STATE_DIM, ACTION_DIM, learning_rate, noise_sigma=noise_sigma, noise_theta=noise_theta)
+        agent = DRLAgent(
+            STATE_DIM,
+            ACTION_DIM,
+            learning_rate,
+            noise_sigma=noise_sigma,
+            noise_theta=noise_theta,
+        )
         agent.gamma = gamma  # Ensure agent uses the trial's gamma
 
-        # Train for a reduced number of episodes for optimization speed
-        optimization_episodes = 100  # Reduced episodes for faster trials
+        dataset_iterator = None
 
-        for episode in tqdm(range(optimization_episodes), desc=f"Trial {trial.number} Training"): # Add tqdm here
+        for episode in tqdm(
+            range(optimization_episodes), desc=f"Trial {trial.number} Training"
+        ):  # Add tqdm here
             state = env.reset()
             done = False
             while not done:
@@ -1289,15 +1508,23 @@ def optimize_agent(OPTIMIZATION_ITERATIONS=40):
                 state = next_state
 
             if len(agent.memory) >= BATCH_SIZE:
-                for _ in range(2):  # Train less frequently during optimization
-                    agent.train()
+                if dataset_iterator is None:
+                    dataset = agent.memory.as_dataset(BATCH_SIZE)
+                    if dataset:
+                        dataset_iterator = iter(dataset)
+
+                if dataset_iterator:
+                    for _ in range(2):  # Train less frequently during optimization
+                        agent.train(dataset_iterator)
 
         # Test the agent and return the mean final portfolio value
         test_env = StockTradingEnvironment(
             STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW
         )
         final_values = []
-        for _ in tqdm(range(OPTIMIZATION_ITERATIONS), desc=f"Trial {trial.number} Testing"): # Add tqdm here
+        for _ in tqdm(
+            range(optimization_test_trials), desc=f"Trial {trial.number} Testing"
+        ):  # Add tqdm here
             state = test_env.reset()
             done = False
             while not done:
@@ -1316,9 +1543,11 @@ def optimize_agent(OPTIMIZATION_ITERATIONS=40):
     study.optimize(objective, n_trials=args.trials, show_progress_bar=True)
 
     logger.info("Optimization finished.")
-    logger.info(f"""Best trial:
+    logger.info(
+        f"""Best trial:
   Value: {study.best_value:.2f}
-  Params: {study.best_params}""")
+  Params: {study.best_params}"""
+    )
 
     # Update global parameters with the best found
     global LEARNING_RATE, BATCH_SIZE, GAMMA, REWARD_SCALING_FACTOR
@@ -1337,15 +1566,27 @@ def optimize_agent(OPTIMIZATION_ITERATIONS=40):
 
 
 def train_agent():
-    """Train the DRL agent using historical data with optimized GPU acceleration"""
+    """Trains the DRL agent using historical data with optimized GPU acceleration.
+
+    Returns:
+        The trained DRLAgent instance.
+    """
     env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
-    agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE, noise_sigma=NOISE_SIGMA, noise_theta=NOISE_THETA)
+    agent = DRLAgent(
+        STATE_DIM,
+        ACTION_DIM,
+        LEARNING_RATE,
+        noise_sigma=NOISE_SIGMA,
+        noise_theta=NOISE_THETA,
+    )
 
     best_reward = -np.inf
     checkpoint_interval = 50  # Save every 50 episodes
 
     # Create a progress bar for training
     progress_bar = tqdm(range(TRAINING_EPISODES), desc="Training Progress")
+
+    dataset_iterator = None
 
     for episode in progress_bar:
         state = env.reset()
@@ -1365,11 +1606,17 @@ def train_agent():
 
         # Train on collected experiences in larger batches
         if len(agent.memory) >= BATCH_SIZE:
-            # Multiple training iterations per episode for better learning
-            for _ in range(4):  # Train 4x per episode
-                losses = agent.train()
-                if losses:
-                    episode_losses.append(losses)
+            if dataset_iterator is None:
+                dataset = agent.memory.as_dataset(BATCH_SIZE)
+                if dataset:
+                    dataset_iterator = iter(dataset)
+
+            if dataset_iterator:
+                # Multiple training iterations per episode for better learning
+                for _ in range(4):  # Train 4x per episode
+                    losses = agent.train(dataset_iterator)
+                    if losses:
+                        episode_losses.append(losses)
 
         # Calculate mean losses for this episode
         if episode_losses:
@@ -1385,7 +1632,7 @@ def train_agent():
             )
             progress_bar.set_postfix(
                 {
-                    "reward": f"{total_reward:.6f}", # Display more decimal places
+                    "reward": f"{total_reward:.6f}",  # Display more decimal places
                     "value": info["portfolio_value"],
                     "actor_loss": mean_actor_loss,
                     "critic_loss": mean_critic_loss,
@@ -1408,9 +1655,19 @@ def train_agent():
 
 
 def test_agent(agent=None):
-    """Test the trained agent"""
+    """Tests the trained agent.
+
+    Args:
+        agent: The DRLAgent instance to test. If None, a new agent is initialized and models are loaded.
+    """
     if agent is None:
-        agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE, noise_sigma=NOISE_SIGMA, noise_theta=NOISE_THETA)
+        agent = DRLAgent(
+            STATE_DIM,
+            ACTION_DIM,
+            LEARNING_RATE,
+            noise_sigma=NOISE_SIGMA,
+            noise_theta=NOISE_THETA,
+        )
         agent.load_models("./models")
 
     env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW)
@@ -1532,11 +1789,11 @@ def test_agent(agent=None):
 def invalidate_cache(symbols=None, days=1):
     """
     Invalidates cache files for the specified symbols or all symbols
-    that are older than the specified number of days
+    that are older than the specified number of days.
 
     Args:
-        symbols: List of symbols to invalidate cache for, or None for all
-        days: Number of days to consider for cache invalidation
+        symbols: List of symbols to invalidate cache for, or None for all.
+        days: Number of days to consider for cache invalidation.
     """
     if symbols is None:
         symbols = STOCK_SYMBOLS
@@ -1569,10 +1826,16 @@ def invalidate_cache(symbols=None, days=1):
 
 
 def run_live_trading():
-    """Run the agent in live trading mode with Alpaca"""
+    """Runs the agent in live trading mode with Alpaca."""
     logger.info("Starting live trading...")
     # Load trained agent
-    agent = DRLAgent(STATE_DIM, ACTION_DIM, LEARNING_RATE, noise_sigma=NOISE_SIGMA, noise_theta=NOISE_THETA)
+    agent = DRLAgent(
+        STATE_DIM,
+        ACTION_DIM,
+        LEARNING_RATE,
+        noise_sigma=NOISE_SIGMA,
+        noise_theta=NOISE_THETA,
+    )
     if not agent.load_models("./models"):
         logger.error("Failed to load model weights. Please train the model first.")
         return
@@ -1720,7 +1983,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--trials",
         type=int,
-        default=50,
+        default=25,
         help="Number of trials for hyperparameter optimization",
     )
     parser.add_argument(
