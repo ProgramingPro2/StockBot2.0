@@ -18,7 +18,6 @@ from tensorflow.keras.layers import (
     BatchNormalization,
 )
 import matplotlib.pyplot as plt
-import yfinance as yf
 import dotenv
 from pathlib import Path
 import logging
@@ -425,34 +424,30 @@ class DRLAgent:
 
     def _build_actor(self):
         """Build policy network (actor) that selects actions with GPU optimizations."""
-        model = Sequential(
-            [
-                # Use CuDNN-optimized layers when running on GPU
-                Dense(
-                    512,
-                    input_shape=(self.state_dim,),
-                    activation="relu",
-                    kernel_initializer=tf.keras.initializers.HeNormal(),
-                ),
-                BatchNormalization(dtype="float32"),
-                Dense(
-                    256,
-                    activation="relu",
-                    kernel_initializer=tf.keras.initializers.HeNormal(),
-                ),
-                BatchNormalization(dtype="float32"),
-                Dense(
-                    128,
-                    activation="relu",
-                    kernel_initializer=tf.keras.initializers.HeNormal(),
-                ),
-                Dense(
-                    self.action_dim,
-                    activation="tanh",
-                    kernel_initializer=tf.keras.initializers.GlorotNormal(),
-                ),
-            ]
-        )
+        state_input = Input(shape=(self.state_dim,))
+        x = Dense(
+            512,
+            activation="relu",
+            kernel_initializer=tf.keras.initializers.HeNormal(),
+        )(state_input)
+        x = BatchNormalization(dtype="float32")(x)
+        x = Dense(
+            256,
+            activation="relu",
+            kernel_initializer=tf.keras.initializers.HeNormal(),
+        )(x)
+        x = BatchNormalization(dtype="float32")(x)
+        x = Dense(
+            128,
+            activation="relu",
+            kernel_initializer=tf.keras.initializers.HeNormal(),
+        )(x)
+        output = Dense(
+            self.action_dim,
+            activation="tanh",
+            kernel_initializer=tf.keras.initializers.GlorotNormal(),
+        )(x)
+        model = Model(inputs=state_input, outputs=output)
         model.compile(loss="mse", optimizer=self.actor_optimizer)
         return model
 
@@ -1023,6 +1018,7 @@ class StockTradingEnvironment:
                 stock_data_obj = stock_data_client.get_stock_bars(request_params)
                 if symbol in stock_data_obj:
                     stock_data = stock_data_obj[symbol].df
+                    stock_data.index = stock_data.index - pd.Timedelta(minutes=15)
                     stock_data = stock_data.rename(
                         columns={
                             "open": "Open",
@@ -1040,16 +1036,8 @@ class StockTradingEnvironment:
                     return symbol, None
             except Exception as e:
                 logger.error(
-                    f"Error downloading {symbol} from Alpaca: {e}. Trying yfinance."
+                    f"Error downloading {symbol} from Alpaca: {e}. No fallback available."
                 )
-                try:
-                    stock_data = yf.download(
-                        symbol, start=start_date, end=end_date, interval="1h"
-                    )
-                    if not stock_data.empty:
-                        return symbol, stock_data
-                except Exception as yf_e:
-                    logger.error(f"yfinance fallback failed for {symbol}: {yf_e}")
                 return symbol, None
 
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -1071,9 +1059,10 @@ class StockTradingEnvironment:
                 dummy_data = pd.DataFrame(
                     index=dummy_index,
                     columns=["Open", "High", "Low", "Close", "Volume"],
+                    dtype=np.float32
                 )
                 dummy_data["Close"] = 100.0
-                dummy_data.fillna(method="ffill", inplace=True)
+                dummy_data.ffill(inplace=True)
                 data[symbol] = dummy_data
                 self._global_data_cache[symbol] = dummy_data
 
@@ -1159,6 +1148,7 @@ class AlpacaTradingSystem:
                 start=end_date
                 - timedelta(hours=1),  # Get last hour to ensure we get data
                 end=end_date,
+                feed='delayed_sip',
             )
             latest_bars_obj = self.stock_data_client.get_stock_bars(request_params)
             latest_bars = latest_bars_obj.df
@@ -1171,64 +1161,20 @@ class AlpacaTradingSystem:
                     logger.info(f"Current price for {symbol}: ${current_price:.2f}")
                 else:
                     logger.warning(
-                        f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback."
+                        f"No real-time price data for {symbol} from Alpaca. Using default price."
                     )
-                    try:
-                        ticker_data = yf.Ticker(symbol)
-                        current_data = ticker_data.history(period="1d", interval="1h")
-                        if not current_data.empty:
-                            current_price = current_data["Close"].iloc[-1]
-                            state.append(
-                                float(current_price) / 1000.0
-                            )  # Normalize price
-                            state.append(
-                                positions[symbol] / 100.0
-                            )  # Normalize position
-                            logger.info(
-                                f"Current price for {symbol} from yfinance: ${current_price:.2f}"
-                            )
-                        else:
-                            logger.warning(
-                                f"No real-time price data for {symbol} from yfinance. Using default price."
-                            )
-                            state.append(100.0 / 1000.0)  # Default normalized price
-                            state.append(
-                                positions[symbol] / 100.0
-                            )  # Normalize position
-                    except Exception as yf_e:
-                        logger.error(
-                            f"Error getting price data for {symbol} from yfinance: {yf_e}. Using default price."
-                        )
-                        state.append(100.0 / 1000.0)  # Default normalized price
-                        state.append(positions[symbol] / 100.0)  # Normalize position
+                    state.append(100.0 / 1000.0)  # Default normalized price
+                    state.append(
+                        positions[symbol] / 100.0
+                    )  # Normalize position
 
         except Exception as e:
             logger.error(
-                f"Error getting current price data for all symbols from Alpaca: {e}. Attempting yfinance fallback for all."
+                f"Error getting current price data for all symbols from Alpaca: {e}. Using default prices."
             )
             for symbol in self.symbols:
-                try:
-                    ticker_data = yf.Ticker(symbol)
-                    current_data = ticker_data.history(period="1d", interval="1h")
-                    if not current_data.empty:
-                        current_price = current_data["Close"].iloc[-1]
-                        state.append(float(current_price) / 1000.0)  # Normalize price
-                        state.append(positions[symbol] / 100.0)  # Normalize position
-                        logger.info(
-                            f"Current price for {symbol} from yfinance: ${current_price:.2f}"
-                        )
-                    else:
-                        logger.warning(
-                            f"No real-time price data for {symbol} from yfinance. Using default price."
-                        )
-                        state.append(100.0 / 1000.0)  # Default normalized price
-                        state.append(positions[symbol] / 100.0)  # Normalize position
-                except Exception as yf_e:
-                    logger.error(
-                        f"Error getting price data for {symbol} from yfinance: {yf_e}. Using default price."
-                    )
-                    state.append(100.0 / 1000.0)  # Default normalized price
-                    state.append(positions[symbol] / 100.0)  # Normalize position
+                state.append(100.0 / 1000.0)  # Default normalized price
+                state.append(positions[symbol] / 100.0)  # Normalize position
 
         state.append(balance / INITIAL_BALANCE)  # Normalized balance
 
@@ -1286,6 +1232,9 @@ class AlpacaTradingSystem:
         # Get actions from agent (no exploration in live trading)
         actions = self.agent.act(state, explore=False)
 
+        if actions is None:
+            return []
+
         # Get current positions to avoid wash trades
         positions = {}
         try:
@@ -1317,6 +1266,7 @@ class AlpacaTradingSystem:
                             timeframe=TimeFrame.Hour,
                             start=datetime.now() - timedelta(hours=1),
                             end=datetime.now(),
+                            feed='delayed_sip',
                         )
                         bars = self.stock_data_client.get_stock_bars(request_params).df
                         if not bars.empty:
@@ -1326,34 +1276,19 @@ class AlpacaTradingSystem:
                             )
                         else:
                             logger.warning(
-                                f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback."
+                                f"No real-time price data for {symbol} from Alpaca. Skipping buy order."
                             )
+                            continue  # Skip to next symbol if no price data
                     except Exception as e:
                         logger.warning(
                             f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback."
                         )
 
                     if current_price is None:
-                        try:
-                            ticker_data = yf.Ticker(symbol)
-                            current_data = ticker_data.history(
-                                period="1d", interval="1h"
-                            )
-                            if not current_data.empty:
-                                current_price = current_data["Close"].iloc[-1]
-                                logger.info(
-                                    f"Latest price for {symbol} from yfinance: ${current_price:.2f}"
-                                )
-                            else:
-                                logger.warning(
-                                    f"No real-time price data for {symbol} from yfinance. Skipping buy order."
-                                )
-                                continue  # Skip to next symbol if no price data
-                        except Exception as yf_e:
-                            logger.error(
-                                f"Error getting price data for {symbol} from yfinance: {yf_e}. Skipping buy order."
-                            )
-                            continue  # Skip to next symbol if no price data
+                        logger.warning(
+                            f"No real-time price data for {symbol} from Alpaca. Skipping buy order."
+                        )
+                        continue  # Skip to next symbol if no price data
 
                     if current_price is not None and current_price > 0:
                         try:
@@ -1389,6 +1324,7 @@ class AlpacaTradingSystem:
                             timeframe=TimeFrame.Hour,
                             start=datetime.now() - timedelta(hours=1),
                             end=datetime.now(),
+                            feed='delayed_sip',
                         )
                         bars = self.stock_data_client.get_stock_bars(request_params).df
                         if not bars.empty:
@@ -1398,34 +1334,19 @@ class AlpacaTradingSystem:
                             )
                         else:
                             logger.warning(
-                                f"No real-time price data for {symbol} from Alpaca. Attempting yfinance fallback."
+                                f"No real-time price data for {symbol} from Alpaca. Skipping buy order."
                             )
+                            continue  # Skip to next symbol if no price data
                     except Exception as e:
                         logger.warning(
                             f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback."
                         )
 
                     if current_price is None:
-                        try:
-                            ticker_data = yf.Ticker(symbol)
-                            current_data = ticker_data.history(
-                                period="1d", interval="1h"
-                            )
-                            if not current_data.empty:
-                                current_price = current_data["Close"].iloc[-1]
-                                logger.info(
-                                    f"Latest price for {symbol} from yfinance: ${current_price:.2f}"
-                                )
-                            else:
-                                logger.warning(
-                                    f"No real-time price data for {symbol} from yfinance. Skipping sell order."
-                                )
-                                continue  # Skip to next symbol if no price data
-                        except Exception as yf_e:
-                            logger.error(
-                                f"Error getting price data for {symbol} from yfinance: {yf_e}. Skipping sell order."
-                            )
-                            continue  # Skip to next symbol if no price data
+                        logger.warning(
+                            f"No real-time price data for {symbol} from Alpaca. Skipping sell order."
+                        )
+                        continue  # Skip to next symbol if no price data
 
                     if current_price is not None and current_price > 0:
                         try:
@@ -1892,17 +1813,18 @@ def run_live_trading():
 
                     # Log the actions in a more readable format
                     action_summary = []
-                    for i, symbol in enumerate(STOCK_SYMBOLS):
-                        signal = actions[i]
-                        if signal > 0.1:  # Buy signal
-                            action_summary.append(f"BUY {symbol}: {signal:.2f}")
-                        elif signal < -0.1:  # Sell signal
-                            action_summary.append(f"SELL {symbol}: {-signal:.2f}")
+                    if actions:
+                        for i, symbol in enumerate(STOCK_SYMBOLS):
+                            signal = actions[i]
+                            if signal > 0.1:  # Buy signal
+                                action_summary.append(f"BUY {symbol}: {signal:.2f}")
+                            elif signal < -0.1:  # Sell signal
+                                action_summary.append(f"SELL {symbol}: {-signal:.2f}")
 
-                    # Log all weights
-                    logger.info("\n--- Model Weights ---")
-                    for i, symbol in enumerate(STOCK_SYMBOLS):
-                        logger.info(f"{symbol}: Signal: {actions[i]:.2f}")
+                        # Log all weights
+                        logger.info("\n--- Model Weights ---")
+                        for i, symbol in enumerate(STOCK_SYMBOLS):
+                            logger.info(f"{symbol}: Signal: {actions[i]:.2f}")
 
                     if action_summary:
                         logger.info(f"Actions taken: {', '.join(action_summary)}")
