@@ -1,13 +1,26 @@
 import pandas as pd
 import numpy as np
 import logging
-from datetime import datetime, timedelta
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from datetime import datetime, timedelta, timezone
+import requests
+import json
+# Removed these as we are now using direct requests for historical bars
+# from alpaca.data.historical import StockHistoricalDataClient
+# from alpaca.data.requests import StockBarsRequest
+# from alpaca.data.timeframe import TimeFrame
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 
+# Ensure config.py is correctly set up with your keys
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    filename="app.log",
+    filemode="a"
+)
 logger = logging.getLogger(__name__)
 
 class StockTradingEnvironment:
@@ -25,6 +38,8 @@ class StockTradingEnvironment:
             initial_balance: The initial cash balance for the trading account.
             lookback_window: The number of historical data points to consider for the state.
             stock_data_client: An instance of StockHistoricalDataClient for fetching data.
+                               NOTE: This client is no longer directly used for bar data fetching
+                                     within _get_data due to the new direct request method.
             cache_dir: The directory for caching stock data.
             max_shares_per_trade: The maximum number of shares to trade in a single transaction.
             reward_scaling_factor: The factor to scale the reward by.
@@ -32,7 +47,7 @@ class StockTradingEnvironment:
         self.symbols = symbols
         self.initial_balance = initial_balance
         self.lookback_window = lookback_window
-        self.stock_data_client = stock_data_client
+        # self.stock_data_client = stock_data_client # Keep if you use it for other data types, but not for bars here
         self.cache_dir = cache_dir
         self.max_shares_per_trade = max_shares_per_trade
         self.reward_scaling_factor = reward_scaling_factor
@@ -56,8 +71,7 @@ class StockTradingEnvironment:
             The initial state of the environment.
         """
         self.balance = self.initial_balance
-        # Use numpy arrays for shares for vectorized operations
-        self.data = self._get_data()
+        self.data = self._get_data() # This calls the modified data fetching method
         self.prefetched_data = self.prefetch_data()
 
         # Ensure we have enough data for lookback window - use numpy for efficiency
@@ -67,11 +81,20 @@ class StockTradingEnvironment:
         min_data_length = np.min(data_lengths) if data_lengths.size > 0 else 0
 
         # Set current step to lookback_window or to data length if not enough data
-        self.current_step = min(self.lookback_window, min_data_length - 1)
-        if self.current_step < self.lookback_window:
+        # IMPORTANT: Since data is now fetched in DESCENDING order (newest first),
+        # self.current_step will represent the index from the MOST RECENT data point.
+        # The environment will effectively run backwards from the latest data.
+        self.current_step = 0 # Start at the most recent data point (index 0)
+
+        if min_data_length < self.lookback_window:
             logger.warning(
-                f"Not enough data for full lookback window. Using {self.current_step} days instead."
+                f"Not enough data for full lookback window. Min data length: {min_data_length} vs lookback_window: {self.lookback_window}."
             )
+            # Adjust if data is shorter than lookback (though with descending, starting at 0 is common)
+            # You might want to ensure min_data_length is at least lookback_window for a stable start
+            if min_data_length <= self.lookback_window:
+                logger.warning(f"Data length ({min_data_length}) is less than or equal to lookback window ({self.lookback_window}). This might lead to unstable states if not handled correctly in _get_state.")
+
 
         self.done = False
         # Pre-allocate memory for history
@@ -81,6 +104,7 @@ class StockTradingEnvironment:
         self._update_current_prices()
 
         return self._get_state()
+
 
     def _update_current_prices(self):
         """Caches the current prices for all symbols to avoid repeated lookups."""
@@ -118,27 +142,63 @@ class StockTradingEnvironment:
             start_idx = lookback_start_idx + (i * self.lookback_window)
             end_idx = start_idx + self.lookback_window
 
-            if self.current_step < self.lookback_window:
-                available_prices = self.prefetched_data[symbol][: self.current_step + 1]
-                if available_prices.size > 0:
-                    first_price = available_prices[0]
-                    prices = np.full(
-                        self.lookback_window, first_price, dtype=np.float32
-                    )
-                    prices[self.lookback_window - available_prices.size :] = (
-                        available_prices
-                    )
-                else:
-                    prices = np.full(self.lookback_window, 100.0, dtype=np.float32)
+            # Adjusting for descending data:
+            # We need prices from current_step to current_step + lookback_window
+            # Since data is newest (current_step) to oldest
+            current_data_for_symbol = self.prefetched_data[symbol]
+            
+            # Ensure we don't go out of bounds for historical data
+            # The slice will take min(len(data), self.lookback_window) elements
+            # starting from current_step.
+            # If current_step + lookback_window is beyond data end, it will just take till end.
+            # We want to look back in time, so if current_step is 0 (most recent), we need 
+            # elements 0, 1, ..., lookback_window-1.
+            # So, the slice should be current_step to current_step + lookback_window
+            
+            # The `_get_state` method should reflect the "lookback" logic properly.
+            # If `self.prefetched_data` is sorted descending (most recent first):
+            # `self.current_step` = 0 means the most recent bar.
+            # `self.current_step` = 1 means the second most recent bar, etc.
+            # So, for the lookback window, you'd want `current_step` and `lookback_window - 1` older bars.
+            
+            # Get the historical prices. Ensure we have enough data.
+            # The slice current_step : current_step + self.lookback_window
+            # will give you the current bar and the next `lookback_window - 1` older bars.
+            # If the data is shorter than requested, it will take what's available.
+            
+            # Example: current_step = 0 (most recent bar), lookback_window = 5
+            # We want bars at index 0, 1, 2, 3, 4. So slice `[0:5]`
+            
+            # Handle cases where there isn't enough historical data
+            # If the number of available bars from `current_step` onwards is less than `lookback_window`,
+            # we should pad or handle this gracefully.
+            
+            # Calculate the actual end index for the lookback slice
+            actual_lookback_end_index = min(
+                self.current_step + self.lookback_window, len(current_data_for_symbol)
+            )
+            
+            # Slice the relevant historical prices
+            prices_slice = current_data_for_symbol[self.current_step : actual_lookback_end_index]
+            
+            # If the slice is shorter than the lookback_window, pad it with the first available price
+            # or a sensible default to maintain state size.
+            if len(prices_slice) < self.lookback_window:
+                # Pad with the oldest available price or a default if no prices at all
+                padding_value = prices_slice[-1] if prices_slice.size > 0 else 100.0
+                prices = np.full(self.lookback_window, padding_value, dtype=np.float32)
+                # Place the actual data at the beginning of the padded array
+                prices[:len(prices_slice)] = prices_slice
             else:
-                prices = self.prefetched_data[symbol][
-                    self.current_step - self.lookback_window : self.current_step
-                ]
+                prices = prices_slice
 
+
+            # Normalize the historical prices
             price_max = np.max(prices) if prices.size > 0 else 1.0
             state[start_idx:end_idx] = prices / max(price_max, 1e-8)
 
         return state
+
 
     def _calculate_portfolio_value(self):
         """Calculates the current portfolio value.
@@ -188,18 +248,19 @@ class StockTradingEnvironment:
                     self.balance += shares_to_sell * current_price
                     self.shares[symbol] -= shares_to_sell
 
-        # Move to next time step
+        # Move to next time step (i.e., move to the next older bar)
         self.current_step += 1
 
-        # Check if we've reached the end of our data
+        # Check if we've reached the end of our data (i.e., exhausted all available historical bars)
         min_data_length = min(
             len(self.prefetched_data[symbol]) for symbol in self.symbols
         )
-        if self.current_step >= min_data_length - 1:
+        if self.current_step >= min_data_length - 1: # -1 because we need at least one bar for _update_current_prices
             self.done = True
 
-        # Update current prices for the new time step
-        self._update_current_prices()
+        # Update current prices for the new time step (which is now an older bar)
+        if not self.done:
+            self._update_current_prices() # Only update if not done to avoid index out of bounds
 
         # Calculate reward as portfolio value change
         old_portfolio_value = self.portfolio_value_history[-1]
@@ -223,33 +284,48 @@ class StockTradingEnvironment:
         )
 
     def _get_data(self):
-        """Gets historical stock data for all symbols with caching using alpaca-py and parallel fetching.
+        """Gets historical stock data for all symbols with caching using direct Alpaca API calls and parallel fetching.
+           Data is fetched in descending order (most recent first).
 
         Returns:
             A dictionary where keys are stock symbols and values are pandas DataFrames of historical data.
         """
+        # BASE_URL for Alpaca Data API stock bars
+        BARS_BASE_URL = "https://data.alpaca.markets/v2/stocks/bars"
+
         if all(symbol in self._global_data_cache for symbol in self.symbols):
             logger.info("Using in-memory cached data for all symbols")
             return {symbol: self._global_data_cache[symbol] for symbol in self.symbols}
 
-        end_date = datetime.now()
+        # Calculate start and end dates relative to current time for consistency
+        # End date is now, start date is (1 year + 2 * lookback) days ago
+        end_date = datetime.now(timezone.utc)
+        # Adjusting start_date to be 365 days + (lookback_window * 2) days
+        # The *2 is just to ensure enough historical data is available, as Alpaca might
+        # limit bars per request or you might need more for training.
         start_date = end_date - timedelta(days=365 + self.lookback_window * 2)
+
         data = {}
         symbols_to_download = []
 
+        # Ensure cache directory exists
+        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
+
         for symbol in self.symbols:
+            # Generate a cache file name that is robust to date range changes
             cache_file = (
                 self.cache_dir
-                / f"{symbol}_{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.pkl"
+                / f"{symbol}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}_desc.pkl" # Added _desc
             )
             if cache_file.exists():
                 try:
                     stock_data = pd.read_pickle(cache_file)
                     data[symbol] = stock_data
                     self._global_data_cache[symbol] = stock_data
+                    logger.info(f"Loaded cached data for {symbol} from {cache_file}")
                 except Exception as e:
                     logger.warning(
-                        f"Failed to load cached data for {symbol}: {e}. Will re-download."
+                        f"Failed to load cached data for {symbol} from {cache_file}: {e}. Will re-download."
                     )
                     symbols_to_download.append(symbol)
             else:
@@ -265,47 +341,97 @@ class StockTradingEnvironment:
 
         def download_symbol_data(symbol):
             try:
-                request_params = StockBarsRequest(
-                    symbol_or_symbols=[symbol],
-                    timeframe=TimeFrame.Hour,
-                    start=start_date,
-                    end=end_date,
+                # Format dates to RFC-3339 with 'Z' for UTC and URL-encode them.
+                start_date_str = quote(start_date.strftime('%Y-%m-%dT%H:%M:%SZ'))
+                end_date_str = quote(end_date.strftime('%Y-%m-%dT%H:%M:%SZ'))
+
+                # Construct the URL with parameters, including sort=desc
+                url = (
+                    f"{BARS_BASE_URL}?"
+                    f"symbols={symbol}&"
+                    f"timeframe=30Min&"
+                    f"start={start_date_str}&"
+                    f"end={end_date_str}&"
+                    f"feed=iex&"
+                    f"sort=desc"
                 )
-                stock_data_obj = self.stock_data_client.get_stock_bars(request_params)
-                if symbol in stock_data_obj:
-                    stock_data = stock_data_obj[symbol].df
-                    stock_data.index = stock_data.index - pd.Timedelta(minutes=15)
+                
+                headers = {
+                    "accept": "application/json",
+                    "APCA-API-KEY-ID": ALPACA_API_KEY,
+                    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
+                }
+                
+                logger.debug(f"Requesting URL for {symbol}: {url}")
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+                
+                api_data = response.json()
+                
+                if api_data and 'bars' in api_data and symbol in api_data['bars'] and api_data['bars'][symbol]:
+                    stock_data = pd.DataFrame(api_data['bars'][symbol])
+                    stock_data['t'] = pd.to_datetime(stock_data['t'])
+                    stock_data = stock_data.set_index('t')
                     stock_data = stock_data.rename(
                         columns={
-                            "open": "Open",
-                            "high": "High",
-                            "low": "Low",
-                            "close": "Close",
-                            "volume": "Volume",
+                            "o": "Open",
+                            "h": "High",
+                            "l": "Low",
+                            "c": "Close",
+                            "v": "Volume",
                         }
                     )
-                    stock_data.index = stock_data.index.map(lambda x: x.date())
-                    stock_data.index.name = "Date"
+                    # Convert index to date only if needed, for hourly data, keeping datetime is often better
+                    # If you convert to date only, multiple bars for the same day will overwrite previous ones
+                    # stock_data.index = stock_data.index.map(lambda x: x.date())
+                    stock_data.index.name = "Timestamp" # Changed from "Date" for hourly data
+                    
+                    logger.info(f"Downloaded {len(stock_data)} bars for {symbol} from Alpaca.")
+                    
+                    # Cache the downloaded data
+                    cache_file = (
+                        Path(self.cache_dir)
+                        / f"{symbol}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}_desc.pkl"
+                    )
+                    stock_data.to_pickle(cache_file)
+                    logger.info(f"Cached data for {symbol} to {cache_file}")
+
                     return symbol, stock_data
                 else:
-                    logger.warning(f"No data for {symbol} from Alpaca.")
+                    logger.warning(f"No bars found for {symbol} from Alpaca in response from {url}. Response: {api_data}")
                     return symbol, None
+            except requests.exceptions.HTTPError as http_err:
+                logger.error(f"HTTP error downloading {symbol}: {http_err} - Response: {http_err.response.text}")
+                return symbol, None
+            except requests.exceptions.RequestException as req_err:
+                logger.error(f"Request error downloading {symbol}: {req_err}")
+                return symbol, None
+            except json.JSONDecodeError as json_err:
+                logger.error(f"JSON decode error for {symbol}: {json_err} - Response: {response.text}")
+                return symbol, None
             except Exception as e:
-                logger.error(
-                    f"Error downloading {symbol} from Alpaca: {e}. No fallback available."
-                )
+                logger.error(f"Unexpected error processing data for {symbol}: {e}", exc_info=True)
                 return symbol, None
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             results = list(executor.map(download_symbol_data, symbols_to_download))
 
-        if not self.symbols:
-            raise ValueError("Could not fetch data for any of the symbols.")
+        # Collect valid data
+        for symbol, stock_data in results:
+            if stock_data is not None:
+                data[symbol] = stock_data
+                self._global_data_cache[symbol] = stock_data
+            else:
+                logger.warning(f"Skipping {symbol} due to failed data download or empty response.")
+
+        if not data: # If no data was fetched for any symbol
+            raise ValueError("Could not fetch valid data for any of the specified symbols.")
 
         return data
 
     def prefetch_data(self):
         """Prefetches data to memory for faster training (CPU-optimized version).
+           Assumes data is sorted descending (most recent first).
 
         Returns:
             A dictionary where keys are stock symbols and values are numpy arrays of close prices.
@@ -316,15 +442,23 @@ class StockTradingEnvironment:
             try:
                 # Only prefetch what we need (close prices)
                 # Store as numpy array for CPU optimization
-                close_prices = np.asarray(
-                    self.data[symbol]["Close"].values, dtype=np.float32
-                )
-                prefetched_data[symbol] = close_prices
+                # Ensure the 'Close' column exists
+                if symbol in self.data and "Close" in self.data[symbol].columns:
+                    close_prices = np.asarray(
+                        self.data[symbol]["Close"].values, dtype=np.float32
+                    )
+                    prefetched_data[symbol] = close_prices
+                else:
+                    logger.warning(f"No 'Close' data found for {symbol} after fetching.")
+                    # Provide dummy data or raise an error, depending on desired behavior
+                    prefetched_data[symbol] = np.full(
+                        self.lookback_window + 1, 100.0, dtype=np.float32 # Ensure enough for lookback
+                    )
             except Exception as e:
-                logger.error(f"Error prefetching data for {symbol}: {e}")
-                # Create dummy data if prefetching fails
+                logger.error(f"Error prefetching data for {symbol}: {e}", exc_info=True)
+                # Create dummy data if prefetching fails to prevent crashes
                 prefetched_data[symbol] = np.full(
-                    1000, 100.0, dtype=np.float32
-                )  # Assuming a default length
+                    self.lookback_window + 1, 100.0, dtype=np.float32
+                ) # Ensure enough for lookback
 
         return prefetched_data

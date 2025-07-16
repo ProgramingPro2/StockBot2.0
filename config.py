@@ -3,6 +3,12 @@ import json
 from pathlib import Path
 import logging
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    filename="app.log",
+    filemode="a"
+)
 logger = logging.getLogger(__name__)
 
 # Set up Alpaca API credentials
@@ -28,7 +34,7 @@ LOOKBACK_WINDOW = 168
 TRADING_FREQUENCY = "hourly"
 MAX_SHARES_PER_TRADE = 5
 TRAINING_EPISODES = 1000
-TEST_EPISODES = 10
+TEST_EPISODES = 100
 REWARD_SCALING_FACTOR = 1000.0
 
 if os.path.exists("stocks.json"):

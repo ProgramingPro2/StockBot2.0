@@ -15,6 +15,12 @@ from config import (
     MAX_SHARES_PER_TRADE,
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    filename="app.log",
+    filemode="a"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -74,7 +80,7 @@ class AlpacaTradingSystem:
                 start=end_date
                 - timedelta(hours=1),  # Get last hour to ensure we get data
                 end=end_date,
-                feed='delayed_sip',
+                feed='iex',
             )
             latest_bars_obj = self.stock_data_client.get_stock_bars(request_params)
             latest_bars = latest_bars_obj.df
@@ -192,7 +198,7 @@ class AlpacaTradingSystem:
                             timeframe=TimeFrame.Hour,
                             start=datetime.now() - timedelta(hours=1),
                             end=datetime.now(),
-                            feed='delayed_sip',
+                            feed='iex',
                         )
                         bars = self.stock_data_client.get_stock_bars(request_params).df
                         if not bars.empty:
@@ -250,7 +256,7 @@ class AlpacaTradingSystem:
                             timeframe=TimeFrame.Hour,
                             start=datetime.now() - timedelta(hours=1),
                             end=datetime.now(),
-                            feed='delayed_sip',
+                            feed='iex',
                         )
                         bars = self.stock_data_client.get_stock_bars(request_params).df
                         if not bars.empty:

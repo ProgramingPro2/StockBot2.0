@@ -2,6 +2,12 @@ import logging
 from datetime import datetime, timedelta
 from config import STOCK_SYMBOLS, CACHE_DIR
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    filename="app.log",
+    filemode="a"
+)
 logger = logging.getLogger(__name__)
 
 def invalidate_cache(symbols=None, days=1):
