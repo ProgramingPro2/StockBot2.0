@@ -58,7 +58,7 @@ if os.path.exists("stocks.json"):
 # RL model parameters
 STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)
 ACTION_DIM = len(STOCK_SYMBOLS)
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0001
 GAMMA = 0.95
 BATCH_SIZE = 4096  # For max GPU utilization on RTX 3090 (with mixed precision)
 MEMORY_SIZE = 100000  # Increased for better training stability

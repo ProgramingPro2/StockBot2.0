@@ -147,7 +147,7 @@ case "$MODE" in
 	run_live_mode
 	log "=== DAILY LIVE MODE SCRIPT COMPLETE ==="
 	;;
-"training")
+""training")
 	log "=== STARTING FRIDAY TRAINING MODE SCRIPT ==="
 	kill_existing_process
 
@@ -156,7 +156,7 @@ case "$MODE" in
 	;;
 "optimize")
 	log "=== STARTING SATURDAY OPTIMIZATION SCRIPT ==="
-	kill_existing_process
+	#kill_existing_process
 
 	run_optimization_mode
 	log "=== SATURDAY OPTIMIZATION SCRIPT COMPLETE ==="

@@ -83,7 +83,7 @@ trading_client = TradingClient(
 )
 stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-def optimize_agent(optimization_episodes=100, optimization_test_trials=5):
+def optimize_agent(optimization_episodes=200, optimization_test_trials=20):
     """
     Performs hyperparameter optimization using Optuna.
 
@@ -587,7 +587,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--trials",
         type=int,
-        default=25,
+        default=50,
         help="Number of trials for hyperparameter optimization",
     )
     parser.add_argument(
