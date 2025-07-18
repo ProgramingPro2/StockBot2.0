@@ -81,21 +81,22 @@ class StockTradingEnvironment:
         min_data_length = np.min(data_lengths) if data_lengths.size > 0 else 0
 
         # Set current step to lookback_window or to data length if not enough data
-        # IMPORTANT: Since data is now fetched in DESCENDING order (newest first),
-        # self.current_step will represent the index from the MOST RECENT data point.
-        # The environment will effectively run backwards from the latest data.
-        self.current_step = 0 # Start at the most recent data point (index 0)
+        # IMPORTANT: Since data is now fetched in ASCENDING order (oldest first),
+        # self.current_step will represent the index from the OLDEST data point.
+        # The environment will effectively run forwards from the oldest data.
+        self.current_step = self.lookback_window # Start after the initial lookback window
 
-        if min_data_length < self.lookback_window:
+        if min_data_length < self.lookback_window + 1: # Need at least lookback_window + 1 data points to start
             logger.warning(
-                f"Not enough data for full lookback window. Min data length: {min_data_length} vs lookback_window: {self.lookback_window}."
+                f"Not enough data for full lookback window. Min data length: {min_data_length} vs required: {self.lookback_window + 1}."
             )
-            # Adjust if data is shorter than lookback (though with descending, starting at 0 is common)
-            # You might want to ensure min_data_length is at least lookback_window for a stable start
-            if min_data_length <= self.lookback_window:
-                logger.warning(f"Data length ({min_data_length}) is less than or equal to lookback window ({self.lookback_window}). This might lead to unstable states if not handled correctly in _get_state.")
+            # If not enough data, start at the earliest possible step
+            self.current_step = min_data_length - 1 if min_data_length > 0 else 0
+            if self.current_step < 0:
+                self.current_step = 0 # Ensure it's not negative
+            logger.warning(f"Adjusted starting step to {self.current_step} due to insufficient data.")
 
-
+        self.shares = {symbol: 0 for symbol in self.symbols}
         self.done = False
         # Pre-allocate memory for history
         self.portfolio_value_history = [self.initial_balance]
@@ -142,53 +143,28 @@ class StockTradingEnvironment:
             start_idx = lookback_start_idx + (i * self.lookback_window)
             end_idx = start_idx + self.lookback_window
 
-            # Adjusting for descending data:
-            # We need prices from current_step to current_step + lookback_window
-            # Since data is newest (current_step) to oldest
+            # Adjusting for ascending data:
+            # We need prices from current_step - lookback_window to current_step
+            # Since data is oldest (index 0) to newest
             current_data_for_symbol = self.prefetched_data[symbol]
             
-            # Ensure we don't go out of bounds for historical data
-            # The slice will take min(len(data), self.lookback_window) elements
-            # starting from current_step.
-            # If current_step + lookback_window is beyond data end, it will just take till end.
-            # We want to look back in time, so if current_step is 0 (most recent), we need 
-            # elements 0, 1, ..., lookback_window-1.
-            # So, the slice should be current_step to current_step + lookback_window
-            
-            # The `_get_state` method should reflect the "lookback" logic properly.
-            # If `self.prefetched_data` is sorted descending (most recent first):
-            # `self.current_step` = 0 means the most recent bar.
-            # `self.current_step` = 1 means the second most recent bar, etc.
-            # So, for the lookback window, you'd want `current_step` and `lookback_window - 1` older bars.
-            
-            # Get the historical prices. Ensure we have enough data.
-            # The slice current_step : current_step + self.lookback_window
-            # will give you the current bar and the next `lookback_window - 1` older bars.
-            # If the data is shorter than requested, it will take what's available.
-            
-            # Example: current_step = 0 (most recent bar), lookback_window = 5
-            # We want bars at index 0, 1, 2, 3, 4. So slice `[0:5]`
-            
-            # Handle cases where there isn't enough historical data
-            # If the number of available bars from `current_step` onwards is less than `lookback_window`,
-            # we should pad or handle this gracefully.
-            
-            # Calculate the actual end index for the lookback slice
-            actual_lookback_end_index = min(
-                self.current_step + self.lookback_window, len(current_data_for_symbol)
-            )
+            # Calculate the actual start and end indices for the lookback slice
+            # The slice should be [current_step - lookback_window : current_step]
+            # Ensure we don't go out of bounds at the beginning of the data
+            actual_lookback_start_index = max(0, self.current_step - self.lookback_window)
+            actual_lookback_end_index = self.current_step
             
             # Slice the relevant historical prices
-            prices_slice = current_data_for_symbol[self.current_step : actual_lookback_end_index]
+            prices_slice = current_data_for_symbol[actual_lookback_start_index : actual_lookback_end_index]
             
-            # If the slice is shorter than the lookback_window, pad it with the first available price
+            # If the slice is shorter than the lookback_window, pad it with the oldest available price
             # or a sensible default to maintain state size.
             if len(prices_slice) < self.lookback_window:
                 # Pad with the oldest available price or a default if no prices at all
-                padding_value = prices_slice[-1] if prices_slice.size > 0 else 100.0
+                padding_value = prices_slice[0] if prices_slice.size > 0 else 100.0
                 prices = np.full(self.lookback_window, padding_value, dtype=np.float32)
-                # Place the actual data at the beginning of the padded array
-                prices[:len(prices_slice)] = prices_slice
+                # Place the actual data at the end of the padded array
+                prices[self.lookback_window - len(prices_slice):] = prices_slice
             else:
                 prices = prices_slice
 
@@ -248,20 +224,6 @@ class StockTradingEnvironment:
                     self.balance += shares_to_sell * current_price
                     self.shares[symbol] -= shares_to_sell
 
-        # Move to next time step (i.e., move to the next older bar)
-        self.current_step += 1
-
-        # Check if we've reached the end of our data (i.e., exhausted all available historical bars)
-        min_data_length = min(
-            len(self.prefetched_data[symbol]) for symbol in self.symbols
-        )
-        if self.current_step >= min_data_length - 1: # -1 because we need at least one bar for _update_current_prices
-            self.done = True
-
-        # Update current prices for the new time step (which is now an older bar)
-        if not self.done:
-            self._update_current_prices() # Only update if not done to avoid index out of bounds
-
         # Calculate reward as portfolio value change
         old_portfolio_value = self.portfolio_value_history[-1]
         new_portfolio_value = self._calculate_portfolio_value()
@@ -275,6 +237,20 @@ class StockTradingEnvironment:
             reward = 0.0
 
         self.portfolio_value_history.append(new_portfolio_value)
+
+        # Move to next time step (i.e., move to the next newer bar)
+        self.current_step += 1
+
+        # Check if we've reached the end of our data (i.e., exhausted all available historical bars)
+        min_data_length = min(
+            len(self.prefetched_data[symbol]) for symbol in self.symbols
+        )
+        if self.current_step >= min_data_length: # No -1 here, as current_step is the index of the *next* bar
+            self.done = True
+
+        # Update current prices for the new time step (which is now a newer bar)
+        if not self.done:
+            self._update_current_prices() # Only update if not done to avoid index out of bounds
 
         return (
             self._get_state(),
@@ -349,11 +325,11 @@ class StockTradingEnvironment:
                 url = (
                     f"{BARS_BASE_URL}?"
                     f"symbols={symbol}&"
-                    f"timeframe=30Min&"
+                    f"timeframe=1H&"
                     f"start={start_date_str}&"
                     f"end={end_date_str}&"
                     f"feed=iex&"
-                    f"sort=desc"
+                    f"sort=asc"
                 )
                 
                 headers = {

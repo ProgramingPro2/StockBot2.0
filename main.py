@@ -1,22 +1,9 @@
-import os
-import pandas as pd
 import numpy as np
 import time
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
 from datetime import datetime, timedelta
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model, load_model
-from tensorflow.keras.layers import (
-    Input,
-    Dense,
-    concatenate,
-    BatchNormalization,
-)
 import matplotlib.pyplot as plt
 import dotenv
 from pathlib import Path
@@ -24,13 +11,10 @@ import logging
 from tqdm import tqdm
 import json
 import optuna
-from concurrent.futures import ThreadPoolExecutor
 
 
-from noise import OrnsteinUhlenbeckActionNoise
-from config import *
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER_TRADING, STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR, STATE_DIM, ACTION_DIM, LEARNING_RATE, BATCH_SIZE, GAMMA, MEMORY_SIZE, NOISE_SIGMA, NOISE_THETA, TRAINING_EPISODES, TEST_EPISODES, TRADING_FREQUENCY
 from utils import invalidate_cache
-from replay_buffer import ReplayBuffer
 from drl_agent import DRLAgent
 from stock_env import StockTradingEnvironment
 from alpaca_trade_system import AlpacaTradingSystem
@@ -49,25 +33,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure GPU memory growth to avoid memory allocation issues
-gpus = tf.config.experimental.list_physical_devices("GPU")
+# Check for GPU availability
+gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
-        # Set memory growth and optimize for RTX 3090
+        # Currently, memory growth needs to be the same across GPUs
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-
-        # Enable mixed precision training for faster performance
-        policy = tf.keras.mixed_precision.Policy("mixed_float16")
-        tf.keras.mixed_precision.set_global_policy(policy)
-
-        logger.info(
-            f"GPU is available. Found {len(gpus)} GPU(s). Mixed precision policy set to {policy.name}"
-        )
+        logical_gpus = tf.config.list_logical_devices('GPU')
+        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+        logger.info(f"GPU is available. Found {len(gpus)} GPU(s).")
     except RuntimeError as e:
-        logger.warning(f"Memory growth setting failed: {e}")
+        # Memory growth must be set before GPUs have been initialized
+        logger.error(f"GPU configuration failed: {e}")
 else:
-    logger.info("No GPU available, using CPU for training")
+    logger.info("No GPU found, using CPU.")
 
 # Enable eager execution
 tf.config.run_functions_eagerly(False)
@@ -83,7 +63,7 @@ trading_client = TradingClient(
 )
 stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-def optimize_agent(optimization_episodes=200, optimization_test_trials=20):
+def optimize_agent(optimization_episodes=1000, optimization_test_trials=100):
     """
     Performs hyperparameter optimization using Optuna.
 

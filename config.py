@@ -35,7 +35,7 @@ TRADING_FREQUENCY = "hourly"
 MAX_SHARES_PER_TRADE = 5
 TRAINING_EPISODES = 1000
 TEST_EPISODES = 100
-REWARD_SCALING_FACTOR = 1000.0
+REWARD_SCALING_FACTOR = 100.0
 
 if os.path.exists("stocks.json"):
     with open("stocks.json", "r") as f:

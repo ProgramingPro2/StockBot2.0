@@ -1,5 +1,5 @@
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, Model, load_model
+from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import (
     Input,
     Dense,
@@ -102,72 +102,74 @@ class DRLAgent:
 
     def _build_actor(self):
         """Build policy network (actor) that selects actions with GPU optimizations."""
-        state_input = Input(shape=(self.state_dim,))
-        x = Dense(
-            512,
-            activation="relu",
-            kernel_initializer=tf.keras.initializers.HeNormal(),
-        )(state_input)
-        x = BatchNormalization(dtype="float32")(x)
-        x = Dense(
-            256,
-            activation="relu",
-            kernel_initializer=tf.keras.initializers.HeNormal(),
-        )(x)
-        x = BatchNormalization(dtype="float32")(x)
-        x = Dense(
-            128,
-            activation="relu",
-            kernel_initializer=tf.keras.initializers.HeNormal(),
-        )(x)
-        output = Dense(
-            self.action_dim,
-            activation="tanh",
-            kernel_initializer=tf.keras.initializers.GlorotNormal(),
-        )(x)
-        model = Model(inputs=state_input, outputs=output)
-        model.compile(loss="mse", optimizer=self.actor_optimizer)
-        return model
+        with tf.device('/GPU:0'):
+            state_input = Input(shape=(self.state_dim,))
+            x = Dense(
+                512,
+                activation="relu",
+                kernel_initializer=tf.keras.initializers.HeNormal(),
+            )(state_input)
+            x = BatchNormalization(dtype="float32")(x)
+            x = Dense(
+                256,
+                activation="relu",
+                kernel_initializer=tf.keras.initializers.HeNormal(),
+            )(x)
+            x = BatchNormalization(dtype="float32")(x)
+            x = Dense(
+                128,
+                activation="relu",
+                kernel_initializer=tf.keras.initializers.HeNormal(),
+            )(x)
+            output = Dense(
+                self.action_dim,
+                activation="tanh",
+                kernel_initializer=tf.keras.initializers.GlorotNormal(),
+            )(x)
+            model = Model(inputs=state_input, outputs=output)
+            model.compile(loss="mse", optimizer=self.actor_optimizer)
+            return model
 
     def _build_critic(self):
         """Build value network (critic) that estimates Q-values with GPU optimizations."""
-        state_input = Input(shape=(self.state_dim,))
-        action_input = Input(shape=(self.action_dim,))
+        with tf.device('/GPU:0'):
+            state_input = Input(shape=(self.state_dim,))
+            action_input = Input(shape=(self.action_dim,))
 
-        # State branch with batch normalization
-        state_h1 = Dense(
-            512, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(state_input)
-        state_bn1 = BatchNormalization(dtype="float32")(state_h1)
-        state_h2 = Dense(
-            256, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(state_bn1)
-        state_bn2 = BatchNormalization(dtype="float32")(state_h2)
+            # State branch with batch normalization
+            state_h1 = Dense(
+                512, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
+            )(state_input)
+            state_bn1 = BatchNormalization(dtype="float32")(state_h1)
+            state_h2 = Dense(
+                256, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
+            )(state_bn1)
+            state_bn2 = BatchNormalization(dtype="float32")(state_h2)
 
-        # Action branch
-        action_h1 = Dense(
-            256, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(action_input)
-        action_bn1 = BatchNormalization(dtype="float32")(action_h1)
+            # Action branch
+            action_h1 = Dense(
+                256, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
+            )(action_input)
+            action_bn1 = BatchNormalization(dtype="float32")(action_h1)
 
-        # Merge
-        merged = concatenate([state_bn2, action_bn1])
-        merged_h1 = Dense(
-            256, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(merged)
-        merged_bn1 = BatchNormalization(dtype="float32")(merged_h1)
-        merged_h2 = Dense(
-            128, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(merged_bn1)
-        output = Dense(
-            1,
-            activation="linear",
-            kernel_initializer=tf.keras.initializers.GlorotNormal(),
-        )(merged_h2)
+            # Merge
+            merged = concatenate([state_bn2, action_bn1])
+            merged_h1 = Dense(
+                256, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
+            )(merged)
+            merged_bn1 = BatchNormalization(dtype="float32")(merged_h1)
+            merged_h2 = Dense(
+                128, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
+            )(merged_bn1)
+            output = Dense(
+                1,
+                activation="linear",
+                kernel_initializer=tf.keras.initializers.GlorotNormal(),
+            )(merged_h2)
 
-        model = Model(inputs=[state_input, action_input], outputs=output)
-        model.compile(loss="mse", optimizer=self.critic_optimizer)
-        return model
+            model = Model(inputs=[state_input, action_input], outputs=output)
+            model.compile(loss="mse", optimizer=self.critic_optimizer)
+            return model
 
     @tf.function
     def _actor_train_step(self, states):
