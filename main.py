@@ -11,7 +11,7 @@ import logging
 from tqdm import tqdm
 import json
 import optuna
-
+from collections import deque
 
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER_TRADING, STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR, STATE_DIM, ACTION_DIM, LEARNING_RATE, BATCH_SIZE, GAMMA, MEMORY_SIZE, NOISE_SIGMA, NOISE_THETA, TRAINING_EPISODES, TEST_EPISODES, TRADING_FREQUENCY
 from utils import invalidate_cache
@@ -83,7 +83,7 @@ def optimize_agent(optimization_episodes=1000, optimization_test_trials=100):
         noise_sigma = trial.suggest_float("noise_sigma", 0.05, 0.3)
         noise_theta = trial.suggest_float("noise_theta", 0.1, 0.5)
         reward_scaling_factor = trial.suggest_float(
-            "reward_scaling_factor", 10.0, 10000.0, log=True
+            "reward_scaling_factor", 100.0, 5000.0, log=True
         )
 
         # Update global parameters or pass them to the agent
@@ -108,6 +108,20 @@ def optimize_agent(optimization_episodes=1000, optimization_test_trials=100):
             noise_theta=noise_theta,
         )
         agent.gamma = gamma  # Ensure agent uses the trial's gamma
+
+        # Pre-fill replay buffer
+        logger.info(f"Pre-filling replay buffer with {batch_size} experiences for trial {trial.number}...")
+        progress_bar_prefill = tqdm(total=batch_size, desc=f"Trial {trial.number} Pre-filling")
+        while len(agent.memory) < batch_size:
+            state = env.reset()
+            done = False
+            while not done and len(agent.memory) < batch_size:
+                action = agent.act(state, explore=True)
+                next_state, reward, done, _ = env.step(action)
+                agent.remember(state, action, reward, next_state, done)
+                state = next_state
+                progress_bar_prefill.update(1)
+        progress_bar_prefill.close()
 
         dataset_iterator = None
 
@@ -197,8 +211,28 @@ def train_agent():
         noise_theta=NOISE_THETA,
     )
 
+    # Pre-fill replay buffer
+    logger.info(f"Pre-filling replay buffer with {BATCH_SIZE} experiences...")
+    progress_bar_prefill = tqdm(total=BATCH_SIZE, desc="Pre-filling Buffer")
+    while len(agent.memory) < BATCH_SIZE:
+        state = env.reset()
+        done = False
+        while not done and len(agent.memory) < BATCH_SIZE:
+            action = agent.act(state, explore=True) # Use random actions
+            next_state, reward, done, _ = env.step(action)
+            agent.remember(state, action, reward, next_state, done)
+            state = next_state
+            progress_bar_prefill.update(1)
+    progress_bar_prefill.close()
+    logger.info("Replay buffer pre-filled.")
+
+
     best_reward = -np.inf
     checkpoint_interval = 50  # Save every 50 episodes
+    early_stopping_patience = 10
+    early_stopping_counter = 0
+    warmup_episodes = 100
+    reward_history = deque(maxlen=100)
 
     # Create a progress bar for training
     progress_bar = tqdm(range(TRAINING_EPISODES), desc="Training Progress")
@@ -256,14 +290,25 @@ def train_agent():
                 }
             )
 
+        reward_history.append(total_reward)
+
         # Save checkpoint periodically
         if episode % checkpoint_interval == 0:
             agent.save_models()
 
-        # Save best model
-        if total_reward > best_reward:
-            best_reward = total_reward
-            agent.save_models("./models")
+        # Save best model and check for early stopping
+        if episode > warmup_episodes:
+            current_avg_reward = np.mean(reward_history)
+            if current_avg_reward > best_reward:
+                best_reward = current_avg_reward
+                agent.save_models("./models")
+                early_stopping_counter = 0
+            else:
+                early_stopping_counter += 1
+
+            if early_stopping_counter >= early_stopping_patience:
+                logger.info(f"Early stopping triggered after {episode} episodes.")
+                break
 
     # Test the trained agent
     test_agent(agent)
@@ -567,7 +612,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--trials",
         type=int,
-        default=50,
+        default=100,
         help="Number of trials for hyperparameter optimization",
     )
     parser.add_argument(

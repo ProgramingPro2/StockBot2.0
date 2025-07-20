@@ -235,8 +235,11 @@ class DRLAgent:
             An array representing the chosen action.
         """
         if explore and np.random.rand() <= self.epsilon:
-            # Exploration: random actions
-            return np.random.uniform(-1, 1, self.action_dim)
+            # Exploration: random actions, including a "sell all" action
+            action = np.random.uniform(-1, 1, self.action_dim)
+            if np.random.rand() < 0.1: # 10% chance to sell all
+                action[np.random.randint(0, self.action_dim)] = 0.6
+            return action
 
         # Exploitation: use the actor to predict actions
         state_tensor = tf.convert_to_tensor(state.reshape(1, -1), dtype=tf.float32)

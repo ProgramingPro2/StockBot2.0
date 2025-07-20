@@ -11,9 +11,10 @@ import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
+import yfinance as yf
 
 # Ensure config.py is correctly set up with your keys
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, USE_YFINANCE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -206,6 +207,8 @@ class StockTradingEnvironment:
                 - info: A dictionary containing additional information (e.g., portfolio value).
         """
         # Map continuous actions to discrete buy/sell decisions
+        transaction_reward = 0
+        profit_reward = 0
         for i, symbol in enumerate(self.symbols):
             signal = action[i]
             current_price = self.current_prices[i]
@@ -216,6 +219,7 @@ class StockTradingEnvironment:
                 if cost <= self.balance and shares_to_buy > 0:
                     self.balance -= cost
                     self.shares[symbol] += shares_to_buy
+                    transaction_reward += 0.01
             elif signal < 0:  # Sell signal
                 shares_to_sell = int(
                     -signal * min(self.max_shares_per_trade, self.shares[symbol])
@@ -223,18 +227,18 @@ class StockTradingEnvironment:
                 if shares_to_sell > 0:
                     self.balance += shares_to_sell * current_price
                     self.shares[symbol] -= shares_to_sell
+                    transaction_reward += 0.01
+                    profit_reward += (shares_to_sell * current_price) - (shares_to_sell * self.current_prices[i])
 
-        # Calculate reward as portfolio value change
+        # Calculate reward as the change in portfolio value
         old_portfolio_value = self.portfolio_value_history[-1]
         new_portfolio_value = self._calculate_portfolio_value()
 
-        # Avoid division by zero and use faster calculation
-        if old_portfolio_value > 0:
-            reward = (
-                (new_portfolio_value - old_portfolio_value) / old_portfolio_value
-            ) * self.reward_scaling_factor
-        else:
-            reward = 0.0
+        # Primary reward is the profit or loss
+        profit_loss_reward = new_portfolio_value - old_portfolio_value
+
+        # Combine reward components
+        reward = profit_loss_reward + transaction_reward * 100 + profit_reward # Increased transaction reward
 
         self.portfolio_value_history.append(new_portfolio_value)
 
@@ -260,8 +264,18 @@ class StockTradingEnvironment:
         )
 
     def _get_data(self):
-        """Gets historical stock data for all symbols with caching using direct Alpaca API calls and parallel fetching.
-           Data is fetched in descending order (most recent first).
+        """Gets historical stock data for all symbols with caching using either Alpaca or yfinance.
+
+        Returns:
+            A dictionary where keys are stock symbols and values are pandas DataFrames of historical data.
+        """
+        if USE_YFINANCE:
+            return self._get_yfinance_data()
+        else:
+            return self._get_alpaca_data()
+        
+    def _get_alpaca_data(self):
+        """Fetches historical stock data from Alpaca Markets API with caching.
 
         Returns:
             A dictionary where keys are stock symbols and values are pandas DataFrames of historical data.
@@ -403,6 +417,41 @@ class StockTradingEnvironment:
         if not data: # If no data was fetched for any symbol
             raise ValueError("Could not fetch valid data for any of the specified symbols.")
 
+        return data
+
+    def _get_yfinance_data(self):
+        """Gets historical stock data for all symbols with caching using yfinance.
+
+        Returns:
+            A dictionary where keys are stock symbols and values are pandas DataFrames of historical data.
+        """
+        data = {}
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=729)
+        for symbol in self.symbols:
+            cache_file = self.cache_dir / f"{symbol}_yfinance.pkl"
+            if cache_file.exists():
+                try:
+                    stock_data = pd.read_pickle(cache_file)
+                    if not stock_data.empty:
+                        data[symbol] = stock_data
+                        self._global_data_cache[symbol] = stock_data
+                        logger.info(f"Loaded cached yfinance data for {symbol} from {cache_file}")
+                    else:
+                        raise ValueError("Cached data is empty.")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to load cached yfinance data for {symbol} from {cache_file}: {e}. Will re-download."
+                    )
+                    stock_data = yf.download(symbol, start=start_date, end=end_date, interval="1h")
+                    if not stock_data.empty:
+                        data[symbol] = stock_data
+                        stock_data.to_pickle(cache_file)
+            else:
+                stock_data = yf.download(symbol, start=start_date, end=end_date, interval="1h")
+                if not stock_data.empty:
+                    data[symbol] = stock_data
+                    stock_data.to_pickle(cache_file)
         return data
 
     def prefetch_data(self):

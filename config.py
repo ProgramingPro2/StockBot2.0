@@ -92,3 +92,6 @@ if hyperparams_path.exists():
 # Cache directory for stock data
 CACHE_DIR = Path("./data_cache")
 CACHE_DIR.mkdir(exist_ok=True)
+
+# Data source configuration
+USE_YFINANCE = True
