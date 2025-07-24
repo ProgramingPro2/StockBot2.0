@@ -165,9 +165,9 @@ class StockTradingEnvironment:
                 padding_value = prices_slice[0] if prices_slice.size > 0 else 100.0
                 prices = np.full(self.lookback_window, padding_value, dtype=np.float32)
                 # Place the actual data at the end of the padded array
-                prices[self.lookback_window - len(prices_slice):] = prices_slice
+                prices[self.lookback_window - len(prices_slice):] = prices_slice.flatten() # Added .flatten()
             else:
-                prices = prices_slice
+                prices = prices_slice.flatten() # Added .flatten()
 
 
             # Normalize the historical prices
@@ -343,7 +343,7 @@ class StockTradingEnvironment:
                     f"start={start_date_str}&"
                     f"end={end_date_str}&"
                     f"feed=iex&"
-                    f"sort=asc"
+                    f"sort=desc"
                 )
                 
                 headers = {

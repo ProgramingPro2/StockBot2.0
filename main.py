@@ -283,14 +283,14 @@ def train_agent():
             )
             progress_bar.set_postfix(
                 {
-                    "reward": f"{total_reward:.6f}",  # Display more decimal places
+                    "reward": f"{total_reward.item():.6f}",  # Display more decimal places
                     "value": info["portfolio_value"],
                     "actor_loss": mean_actor_loss,
                     "critic_loss": mean_critic_loss,
                 }
             )
 
-        reward_history.append(total_reward)
+        reward_history.append(total_reward.item())
 
         # Save checkpoint periodically
         if episode % checkpoint_interval == 0:
@@ -358,7 +358,7 @@ def test_agent(agent=None):
 
         if episode % 10 == 0:  # Print only every 10 episodes to reduce output
             logger.info(
-                f"Test Episode {episode + 1}/{TEST_EPISODES}, Final Reward: {total_reward:.6f}, Final Portfolio Value: {info['portfolio_value']:.2f}"
+                f"Test Episode {episode + 1}/{TEST_EPISODES}, Final Reward: {total_reward.item():.6f}, Final Portfolio Value: {info['portfolio_value']:.2f}"
             )
 
     # Calculate statistics

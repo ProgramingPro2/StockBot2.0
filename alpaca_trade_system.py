@@ -69,6 +69,7 @@ class AlpacaTradingSystem:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=LOOKBACK_WINDOW + 5)  # Add buffer days
 
+        current_prices = {}
         # Get current price data from Alpaca for all symbols at once
         try:
             request_params = StockBarsRequest(
@@ -85,6 +86,7 @@ class AlpacaTradingSystem:
             for symbol in self.symbols:
                 if symbol in latest_bars.index.get_level_values("symbol"):
                     current_price = latest_bars.loc[symbol]["close"].iloc[-1]
+                    current_prices[symbol] = current_price
                     state.append(float(current_price) / 1000.0)  # Normalize price
                     state.append(positions[symbol] / 100.0)  # Normalize position
                     logger.info(f"Current price for {symbol}: ${current_price:.2f}")
@@ -147,7 +149,7 @@ class AlpacaTradingSystem:
                 # Add placeholder data to maintain state vector size
                 state.extend([0.0] * LOOKBACK_WINDOW)
 
-        return np.array(state, dtype=np.float32)
+        return np.array(state, dtype=np.float32), current_prices
 
     def execute_trades(self):
         """Executes trades based on the agent's decisions while avoiding wash trades.
@@ -156,7 +158,7 @@ class AlpacaTradingSystem:
             A list of actions taken (buy/sell signals) for each symbol.
         """
         # Get current state
-        state = self._get_current_state()
+        state, current_prices = self._get_current_state()
 
         # Get actions from agent (no exploration in live trading)
         actions = self.agent.act(state, explore=False)
@@ -187,38 +189,7 @@ class AlpacaTradingSystem:
             if signal > 0:  # Buy signal
                 shares_to_buy = int(signal * MAX_SHARES_PER_TRADE)
                 if shares_to_buy > 0:
-                    current_price = None
-                    try:
-                        # Attempt to get latest price with Alpaca
-                        request_params = StockBarsRequest(
-                            symbol_or_symbols=[symbol],
-                            timeframe=TimeFrame.Hour,
-                            start=datetime.now() - timedelta(hours=1),
-                            end=datetime.now(),
-                            feed='iex',
-                        )
-                        bars = self.stock_data_client.get_stock_bars(request_params).df
-                        if not bars.empty:
-                            current_price = bars["close"].iloc[-1]
-                            logger.info(
-                                f"Latest price for {symbol} from Alpaca: ${current_price:.2f}"
-                            )
-                        else:
-                            logger.warning(
-                                f"No real-time price data for {symbol} from Alpaca. Skipping buy order."
-                            )
-                            continue  # Skip to next symbol if no price data
-                    except Exception as e:
-                        logger.warning(
-                            f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback."
-                        )
-
-                    if current_price is None:
-                        logger.warning(
-                            f"No real-time price data for {symbol} from Alpaca. Skipping buy order."
-                        )
-                        continue  # Skip to next symbol if no price data
-
+                    current_price = current_prices.get(symbol)
                     if current_price is not None and current_price > 0:
                         try:
                             # Submit order
@@ -245,38 +216,7 @@ class AlpacaTradingSystem:
                     -signal * min(MAX_SHARES_PER_TRADE, current_shares)
                 )
                 if shares_to_sell > 0:
-                    current_price = None
-                    try:
-                        # Attempt to get latest price with Alpaca
-                        request_params = StockBarsRequest(
-                            symbol_or_symbols=[symbol],
-                            timeframe=TimeFrame.Hour,
-                            start=datetime.now() - timedelta(hours=1),
-                            end=datetime.now(),
-                            feed='iex',
-                        )
-                        bars = self.stock_data_client.get_stock_bars(request_params).df
-                        if not bars.empty:
-                            current_price = bars["close"].iloc[-1]
-                            logger.info(
-                                f"Latest price for {symbol} from Alpaca: ${current_price:.2f}"
-                            )
-                        else:
-                            logger.warning(
-                                f"No real-time price data for {symbol} from Alpaca. Skipping buy order."
-                            )
-                            continue  # Skip to next symbol if no price data
-                    except Exception as e:
-                        logger.warning(
-                            f"Error getting price data for {symbol} from Alpaca: {e}. Attempting yfinance fallback."
-                        )
-
-                    if current_price is None:
-                        logger.warning(
-                            f"No real-time price data for {symbol} from Alpaca. Skipping sell order."
-                        )
-                        continue  # Skip to next symbol if no price data
-
+                    current_price = current_prices.get(symbol)
                     if current_price is not None and current_price > 0:
                         try:
                             # Submit order
