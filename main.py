@@ -97,6 +97,8 @@ def optimize_agent(optimization_episodes=1000, optimization_test_trials=100):
         )
 
         # Train the agent with suggested hyperparameters
+        invalidate_cache(days=0)
+        StockTradingEnvironment.clear_in_memory_cache()
         env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, reward_scaling_factor)
         agent = DRLAgent(
             STATE_DIM,
@@ -147,6 +149,8 @@ def optimize_agent(optimization_episodes=1000, optimization_test_trials=100):
                         agent.train(dataset_iterator)
 
         # Test the agent and return the mean final portfolio value
+        invalidate_cache(days=0)
+        StockTradingEnvironment.clear_in_memory_cache()
         test_env = StockTradingEnvironment(
             STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, reward_scaling_factor
         )
@@ -200,6 +204,8 @@ def train_agent():
     Returns:
         The trained DRLAgent instance.
     """
+    invalidate_cache(days=0)
+    StockTradingEnvironment.clear_in_memory_cache()
     env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR)
     agent = DRLAgent(
         STATE_DIM,
@@ -241,7 +247,7 @@ def train_agent():
 
     for episode in progress_bar:
         state = env.reset()
-        total_reward = 0
+        total_reward = 0.0
         done = False
         episode_losses = []
 
@@ -283,14 +289,14 @@ def train_agent():
             )
             progress_bar.set_postfix(
                 {
-                    "reward": f"{total_reward.item():.6f}",  # Display more decimal places
+                    "reward": f"{total_reward:.6f}",  # Display more decimal places
                     "value": info["portfolio_value"],
                     "actor_loss": mean_actor_loss,
                     "critic_loss": mean_critic_loss,
                 }
             )
 
-        reward_history.append(total_reward.item())
+        reward_history.append(total_reward)
 
         # Save checkpoint periodically
         if episode % checkpoint_interval == 0:
@@ -334,6 +340,8 @@ def test_agent(agent=None):
         )
         agent.load_models("./models")
 
+    invalidate_cache(days=0)
+    StockTradingEnvironment.clear_in_memory_cache()
     env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR)
 
     total_rewards = []
@@ -341,7 +349,7 @@ def test_agent(agent=None):
 
     for episode in tqdm(range(TEST_EPISODES), desc="Testing Progress"):
         state = env.reset()
-        total_reward = 0
+        total_reward = 0.0
         done = False
         episode_portfolio = [INITIAL_BALANCE]
 
@@ -358,7 +366,7 @@ def test_agent(agent=None):
 
         if episode % 10 == 0:  # Print only every 10 episodes to reduce output
             logger.info(
-                f"Test Episode {episode + 1}/{TEST_EPISODES}, Final Reward: {total_reward.item():.6f}, Final Portfolio Value: {info['portfolio_value']:.2f}"
+                f"Test Episode {episode + 1}/{TEST_EPISODES}, Final Reward: {total_reward:.6f}, Final Portfolio Value: {info['portfolio_value'].item():.2f}"
             )
 
     # Calculate statistics
@@ -377,11 +385,11 @@ def test_agent(agent=None):
     # Plot results
     plt.figure(figsize=(14, 8))  # Slightly larger figure for better readability
 
-    # Determine the minimum length of all portfolio value histories
-    min_len = min(len(p) for p in portfolio_values)
+    # Determine the maximum length of all portfolio value histories
+    max_len = max(len(p) for p in portfolio_values)
 
-    # Align all portfolio histories to the minimum length for accurate averaging
-    aligned_portfolios = [np.array(p[:min_len]) for p in portfolio_values]
+    # Align all portfolio histories to the maximum length for accurate averaging
+    aligned_portfolios = [np.pad(p, (0, max_len - len(p)), 'edge') for p in portfolio_values]
 
     # Plot average portfolio value
     avg_portfolio = np.mean(aligned_portfolios, axis=0)
@@ -473,6 +481,7 @@ def run_live_trading():
 
     # Invalidate cache at the start to ensure fresh data
     invalidate_cache(days=1)
+    StockTradingEnvironment.clear_in_memory_cache()
 
     # Variables for tracking time since last cache invalidation
     last_cache_invalidation = datetime.now()
@@ -506,7 +515,7 @@ def run_live_trading():
                         retry_delay *= 2  # Exponential backoff
                     else:
                         logger.error(
-                            f"Failed to connect to API after {max_retries} attempts: {e}"
+                            f"Failed to connect to API after {max_retries} attempts"
                         )
                         # Wait longer before trying again to avoid hammering the API
                         time.sleep(300)  # 5 minutes
@@ -515,7 +524,7 @@ def run_live_trading():
 
             try:
                 if clock.is_open:
-                    logger.info("\n--- Executing Trades ---")
+                    logger.info(f'\n--- Executing Trades ---')
                     actions = trading_system.execute_trades()
 
                     # Log the actions in a more readable format
@@ -580,7 +589,7 @@ def run_live_trading():
                     logger.info("Market is closed. Waiting for market to open...")
                     time.sleep(60)  # Check every hour if market opened
             except Exception as e:
-                logger.error(f"Error during trading operations: {e}")
+                logger.error(f"Error: {e}")
                 # Add a delay to prevent rapid retries if there's a persistent error
                 time.sleep(60)
 

@@ -30,6 +30,11 @@ class StockTradingEnvironment:
     # Class-level cache for stock data across all instances
     _global_data_cache = {}
 
+    @staticmethod
+    def clear_in_memory_cache():
+        StockTradingEnvironment._global_data_cache.clear()
+        logger.info("In-memory data cache cleared.")
+
     def __init__(self, symbols, initial_balance, lookback_window, stock_data_client, cache_dir, max_shares_per_trade, reward_scaling_factor):
         """
         Initializes the StockTradingEnvironment.
@@ -72,12 +77,13 @@ class StockTradingEnvironment:
             The initial state of the environment.
         """
         self.balance = self.initial_balance
-        self.data = self._get_data() # This calls the modified data fetching method
+        self.data, failed_symbols = self._get_data() # This calls the modified data fetching method
+        self.symbols = [s for s in self.symbols if s not in failed_symbols]
         self.prefetched_data = self.prefetch_data()
 
         # Ensure we have enough data for lookback window - use numpy for efficiency
         data_lengths = np.array(
-            [len(self.prefetched_data[symbol]) for symbol in self.symbols]
+            [len(self.prefetched_data[symbol]) for symbol in self.symbols if symbol in self.prefetched_data]
         )
         min_data_length = np.min(data_lengths) if data_lengths.size > 0 else 0
 
@@ -113,7 +119,7 @@ class StockTradingEnvironment:
         self.current_prices = np.array(
             [
                 self.prefetched_data[symbol][self.current_step]
-                for symbol in self.symbols
+                for symbol in self.symbols if symbol in self.prefetched_data
             ],
             dtype=np.float32,
         )
@@ -130,9 +136,11 @@ class StockTradingEnvironment:
         # Current price and holdings with vectorized operations
         prices = self.current_prices / self.price_normalization
         shares = (
-            np.array([self.shares[s] for s in self.symbols], dtype=np.float32)
+            np.array([self.shares[s] for s in self.symbols if s in self.prefetched_data], dtype=np.float32)
             / self.shares_normalization
         )
+        if len(prices) != len(shares):
+            return state
         state[: len(self.symbols) * 2] = np.column_stack((prices, shares)).flatten()
 
         # Add normalized balance
@@ -141,6 +149,8 @@ class StockTradingEnvironment:
         # Add historical price data in a vectorized way
         lookback_start_idx = (len(self.symbols) * 2) + 1
         for i, symbol in enumerate(self.symbols):
+            if symbol not in self.prefetched_data:
+                continue
             start_idx = lookback_start_idx + (i * self.lookback_window)
             end_idx = start_idx + self.lookback_window
 
@@ -187,7 +197,7 @@ class StockTradingEnvironment:
         portfolio_value = self.balance
 
         # Vectorized calculation using numpy for efficiency
-        shares = np.array([self.shares[s] for s in self.symbols], dtype=np.float32)
+        shares = np.array([self.shares[s] for s in self.symbols if s in self.prefetched_data], dtype=np.float32)
         portfolio_value += np.sum(shares * self.current_prices)
 
         return portfolio_value
@@ -210,6 +220,8 @@ class StockTradingEnvironment:
         transaction_reward = 0
         profit_reward = 0
         for i, symbol in enumerate(self.symbols):
+            if symbol not in self.prefetched_data:
+                continue
             signal = action[i]
             current_price = self.current_prices[i]
 
@@ -247,7 +259,7 @@ class StockTradingEnvironment:
 
         # Check if we've reached the end of our data (i.e., exhausted all available historical bars)
         min_data_length = min(
-            len(self.prefetched_data[symbol]) for symbol in self.symbols
+            len(self.prefetched_data[symbol]) for symbol in self.symbols if symbol in self.prefetched_data
         )
         if self.current_step >= min_data_length: # No -1 here, as current_step is the index of the *next* bar
             self.done = True
@@ -258,7 +270,7 @@ class StockTradingEnvironment:
 
         return (
             self._get_state(),
-            reward,
+            float(reward),
             self.done,
             {"portfolio_value": new_portfolio_value},
         )
@@ -323,7 +335,7 @@ class StockTradingEnvironment:
 
         if not symbols_to_download:
             logger.info("All data loaded from cache.")
-            return data
+            return data, []
 
         logger.info(
             f"Downloading data for {len(symbols_to_download)} symbols: {symbols_to_download}..."
@@ -407,17 +419,19 @@ class StockTradingEnvironment:
             results = list(executor.map(download_symbol_data, symbols_to_download))
 
         # Collect valid data
+        failed_symbols = []
         for symbol, stock_data in results:
             if stock_data is not None:
                 data[symbol] = stock_data
                 self._global_data_cache[symbol] = stock_data
             else:
                 logger.warning(f"Skipping {symbol} due to failed data download or empty response.")
+                failed_symbols.append(symbol)
 
         if not data: # If no data was fetched for any symbol
             raise ValueError("Could not fetch valid data for any of the specified symbols.")
 
-        return data
+        return data, failed_symbols
 
     def _get_yfinance_data(self):
         """Gets historical stock data for all symbols with caching using yfinance.
@@ -426,12 +440,13 @@ class StockTradingEnvironment:
             A dictionary where keys are stock symbols and values are pandas DataFrames of historical data.
         """
         data = {}
+        failed_symbols = []
         end_date = datetime.now()
         start_date = end_date - timedelta(days=729)
         for symbol in self.symbols:
             cache_file = self.cache_dir / f"{symbol}_yfinance.pkl"
-            if cache_file.exists():
-                try:
+            try:
+                if cache_file.exists():
                     stock_data = pd.read_pickle(cache_file)
                     if not stock_data.empty:
                         data[symbol] = stock_data
@@ -439,20 +454,15 @@ class StockTradingEnvironment:
                         logger.info(f"Loaded cached yfinance data for {symbol} from {cache_file}")
                     else:
                         raise ValueError("Cached data is empty.")
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to load cached yfinance data for {symbol} from {cache_file}: {e}. Will re-download."
-                    )
+                else:
                     stock_data = yf.download(symbol, start=start_date, end=end_date, interval="1h")
                     if not stock_data.empty:
                         data[symbol] = stock_data
                         stock_data.to_pickle(cache_file)
-            else:
-                stock_data = yf.download(symbol, start=start_date, end=end_date, interval="1h")
-                if not stock_data.empty:
-                    data[symbol] = stock_data
-                    stock_data.to_pickle(cache_file)
-        return data
+            except Exception as e:
+                logger.error(f"Failed to download or load data for {symbol}: {e}")
+                failed_symbols.append(symbol)
+        return data, failed_symbols
 
     def prefetch_data(self):
         """Prefetches data to memory for faster training (CPU-optimized version).
@@ -463,7 +473,7 @@ class StockTradingEnvironment:
         """
         # Convert and cache frequently accessed data for faster access
         prefetched_data = {}
-        for symbol in self.symbols:
+        for symbol in self.data.keys():
             try:
                 # Only prefetch what we need (close prices)
                 # Store as numpy array for CPU optimization
