@@ -2,12 +2,15 @@ import os
 import json
 from pathlib import Path
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     filename="app.log",
-    filemode="a"
+    filemode="w"
 )
 logger = logging.getLogger(__name__)
 
@@ -15,6 +18,41 @@ logger = logging.getLogger(__name__)
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_PAPER_TRADING = os.getenv("ALPACA_PAPER_TRADING", "True").lower() == "true"
+
+def validate_config():
+    """
+    Validates the configuration and raises errors for missing or invalid settings.
+    """
+    errors = []
+    
+    # Check API credentials
+    if not ALPACA_API_KEY:
+        errors.append("ALPACA_API_KEY not found in environment variables")
+    if not ALPACA_SECRET_KEY:
+        errors.append("ALPACA_SECRET_KEY not found in environment variables")
+    
+    # Check stock symbols
+    if not STOCK_SYMBOLS:
+        errors.append("No stock symbols configured")
+    elif len(STOCK_SYMBOLS) == 0:
+        errors.append("Stock symbols list is empty")
+    
+    # Check other critical parameters
+    if INITIAL_BALANCE <= 0:
+        errors.append("Initial balance must be positive")
+    if LOOKBACK_WINDOW <= 0:
+        errors.append("Lookback window must be positive")
+    if MAX_SHARES_PER_TRADE <= 0:
+        errors.append("Max shares per trade must be positive")
+    
+    if errors:
+        error_msg = "Configuration validation failed:\n" + "\n".join(f"- {error}" for error in errors)
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    
+    logger.info("Configuration validation passed")
+    logger.info(f"Trading {len(STOCK_SYMBOLS)} symbols with ${INITIAL_BALANCE} initial balance")
+    logger.info(f"Paper trading enabled: {ALPACA_PAPER_TRADING}")
 
 # Configuration parameters
 STOCK_SYMBOLS = [
@@ -35,7 +73,7 @@ TRADING_FREQUENCY = "hourly"
 MAX_SHARES_PER_TRADE = 5
 TRAINING_EPISODES = 1000
 TEST_EPISODES = 100
-REWARD_SCALING_FACTOR = 100.0
+REWARD_SCALING_FACTOR = 1.0  # Reduced from 100.0 to prevent unrealistic rewards
 
 if os.path.exists("stocks.json"):
     with open("stocks.json", "r") as f:
@@ -95,3 +133,6 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 # Data source configuration
 USE_YFINANCE = True
+
+# Validate configuration after all parameters are loaded
+validate_config()

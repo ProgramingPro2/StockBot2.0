@@ -5,6 +5,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+import time # Added for retry logic
 
 from config import (
     INITIAL_BALANCE,
@@ -47,65 +48,90 @@ class AlpacaTradingSystem:
         """
         state = []
 
-        # Get account information from Alpaca
-        try:
-            account = self.trading_client.get_account()
-            balance = float(account.cash)
-        except Exception as e:
-            logger.error(f"Error getting account info: {e}")
-            balance = INITIAL_BALANCE  # Use default if API fails
+        # Get account information from Alpaca with retry logic
+        balance = INITIAL_BALANCE  # Default fallback
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                account = self.trading_client.get_account()
+                balance = float(account.cash)
+                logger.info(f"Successfully retrieved account balance: ${balance:.2f}")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Failed to get account info (attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error(f"Failed to get account info after {max_retries} attempts, using default balance")
+                    balance = INITIAL_BALANCE
 
-        # Get current positions from Alpaca
+        # Get current positions from Alpaca with retry logic
         positions = {sym: 0 for sym in self.symbols}
-        try:
-            current_positions = self.trading_client.get_all_positions()
-            for position in current_positions:
-                if position.symbol in self.symbols:
-                    positions[position.symbol] = int(float(position.qty))
-        except Exception as e:
-            logger.error(f"Error getting positions: {e}")
+        for attempt in range(max_retries):
+            try:
+                current_positions = self.trading_client.get_all_positions()
+                for position in current_positions:
+                    if position.symbol in self.symbols:
+                        positions[position.symbol] = int(float(position.qty))
+                logger.info(f"Successfully retrieved positions for {len(positions)} symbols")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Failed to get positions (attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Failed to get positions after {max_retries} attempts, using zero positions")
 
-        # Get current price data from Alpaca
+        # Get current price data from Alpaca with retry logic
         end_date = datetime.now()
         start_date = end_date - timedelta(days=LOOKBACK_WINDOW + 5)  # Add buffer days
 
         current_prices = {}
-        # Get current price data from Alpaca for all symbols at once
-        try:
-            request_params = StockBarsRequest(
-                symbol_or_symbols=self.symbols,
-                timeframe=TimeFrame.Hour,  # Use hour data for current price
-                start=end_date
-                - timedelta(hours=1),  # Get last hour to ensure we get data
-                end=end_date,
-                feed='iex',
-            )
-            latest_bars_obj = self.stock_data_client.get_stock_bars(request_params)
-            latest_bars = latest_bars_obj.df
+        for attempt in range(max_retries):
+            try:
+                # Get current price data from Alpaca for all symbols at once
+                request_params = StockBarsRequest(
+                    symbol_or_symbols=self.symbols,
+                    timeframe=TimeFrame.Hour,  # Use hour data for current price
+                    start=end_date
+                    - timedelta(hours=1),  # Get last hour to ensure we get data
+                    end=end_date,
+                    feed='iex',
+                )
+                latest_bars_obj = self.stock_data_client.get_stock_bars(request_params)
+                latest_bars = latest_bars_obj.df
 
-            for symbol in self.symbols:
-                if symbol in latest_bars.index.get_level_values("symbol"):
-                    current_price = latest_bars.loc[symbol]["close"].iloc[-1]
-                    current_prices[symbol] = current_price
-                    state.append(float(current_price) / 1000.0)  # Normalize price
-                    state.append(positions[symbol] / 100.0)  # Normalize position
-                    logger.info(f"Current price for {symbol}: ${current_price:.2f}")
+                for symbol in self.symbols:
+                    if symbol in latest_bars.index.get_level_values("symbol"):
+                        current_price = latest_bars.loc[symbol]["close"].iloc[-1]
+                        current_prices[symbol] = current_price
+                        state.append(float(current_price) / 1000.0)  # Normalize price
+                        state.append(positions[symbol] / 100.0)  # Normalize position
+                        logger.info(f"Current price for {symbol}: ${current_price:.2f}")
+                    else:
+                        logger.warning(
+                            f"No real-time price data for {symbol} from Alpaca. Using default price."
+                        )
+                        state.append(100.0 / 1000.0)  # Default normalized price
+                        state.append(
+                            positions[symbol] / 100.0
+                        )  # Normalize position
+                
+                logger.info(f"Successfully retrieved prices for {len(current_prices)} symbols")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Failed to get price data (attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(retry_delay)
                 else:
-                    logger.warning(
-                        f"No real-time price data for {symbol} from Alpaca. Using default price."
-                    )
-                    state.append(100.0 / 1000.0)  # Default normalized price
-                    state.append(
-                        positions[symbol] / 100.0
-                    )  # Normalize position
-
-        except Exception as e:
-            logger.error(
-                f"Error getting current price data for all symbols from Alpaca: {e}. Using default prices."
-            )
-            for symbol in self.symbols:
-                state.append(100.0 / 1000.0)  # Default normalized price
-                state.append(positions[symbol] / 100.0)  # Normalize position
+                    logger.error(f"Failed to get price data after {max_retries} attempts, using default prices")
+                    # Use default prices as fallback
+                    for symbol in self.symbols:
+                        state.append(100.0 / 1000.0)  # Default normalized price
+                        state.append(positions[symbol] / 100.0)  # Normalize position
 
         state.append(balance / INITIAL_BALANCE)  # Normalized balance
 

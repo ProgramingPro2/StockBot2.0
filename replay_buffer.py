@@ -110,7 +110,7 @@ class ReplayBuffer:
         np.savez_compressed(path, **buffer_data)
 
     def load(self, path):
-        """Load replay buffer from disk"""
+        """Load replay buffer from disk with improved error handling"""
         if not os.path.exists(path):
             logger.info(f"Replay buffer file not found: {path}")
             return False
@@ -128,45 +128,71 @@ class ReplayBuffer:
                 "position",
                 "size",
             ]
-            if not all(key in data for key in expected_keys):
+            missing_keys = [key for key in expected_keys if key not in data]
+            if missing_keys:
                 logger.error(
-                    f"Corrupted replay buffer file: {path}. Missing expected keys."
+                    f"Corrupted replay buffer file: {path}. Missing keys: {missing_keys}"
                 )
-                self.position = 0
-                self.size = 0
+                self._reset_buffer()
                 return False
 
             size = min(int(data["size"]), self.capacity)
-            if size > 0:
-                # Ensure loaded arrays have compatible shapes before assignment
-                if (
-                    data["states"].shape[1] != self.states.shape[1]
-                    or data["actions"].shape[1] != self.actions.shape[1]
-                ):
-                    logger.error(
-                        f"Shape mismatch when loading replay buffer from {path}. Buffer dimensions might have changed."
-                    )
-                    self.position = 0
-                    self.size = 0
-                    return False
-
-                self.states[:size] = data["states"][:size]
-                self.actions[:size] = data["actions"][:size]
-                self.rewards[:size] = data["rewards"][:size]
-                self.next_states[:size] = data["next_states"][:size]
-                self.dones[:size] = data["dones"][:size]
-
-                self.position = int(data["position"]) % self.capacity
-                self.size = size
-                logger.info(f"Replay buffer loaded {self.size} transitions from {path}")
-                return True
-            else:
+            if size <= 0:
                 logger.warning(f"Replay buffer file {path} was empty or had size 0.")
-                self.position = 0
-                self.size = 0
+                self._reset_buffer()
                 return False
+
+            # Validate shapes before loading
+            try:
+                self._validate_shapes(data, size)
+            except ValueError as e:
+                logger.error(f"Shape validation failed: {e}")
+                self._reset_buffer()
+                return False
+
+            # Load data with shape validation
+            self._load_validated_data(data, size)
+            
+            logger.info(f"Replay buffer loaded {self.size} transitions from {path}")
+            return True
+            
         except Exception as e:
             logger.error(f"Error loading replay buffer from {path}: {e}")
-            self.position = 0
-            self.size = 0
+            self._reset_buffer()
             return False
+
+    def _validate_shapes(self, data, size):
+        """Validate that loaded data has compatible shapes"""
+        expected_state_shape = (size, self.states.shape[1])
+        expected_action_shape = (size, self.actions.shape[1])
+        
+        if data["states"].shape[:2] != expected_state_shape:
+            raise ValueError(
+                f"State shape mismatch: expected {expected_state_shape}, got {data['states'].shape[:2]}"
+            )
+        
+        if data["actions"].shape[:2] != expected_action_shape:
+            raise ValueError(
+                f"Action shape mismatch: expected {expected_action_shape}, got {data['actions'].shape[:2]}"
+            )
+        
+        # Check other arrays have correct length
+        for key in ["rewards", "next_states", "dones"]:
+            if len(data[key]) != size:
+                raise ValueError(f"{key} length mismatch: expected {size}, got {len(data[key])}")
+
+    def _load_validated_data(self, data, size):
+        """Load data after validation has passed"""
+        self.states[:size] = data["states"][:size]
+        self.actions[:size] = data["actions"][:size]
+        self.rewards[:size] = data["rewards"][:size]
+        self.next_states[:size] = data["next_states"][:size]
+        self.dones[:size] = data["dones"][:size]
+        
+        self.position = int(data["position"]) % self.capacity
+        self.size = size
+
+    def _reset_buffer(self):
+        """Reset buffer to empty state"""
+        self.position = 0
+        self.size = 0

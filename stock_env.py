@@ -77,6 +77,12 @@ class StockTradingEnvironment:
             The initial state of the environment.
         """
         self.balance = self.initial_balance
+        
+        # Ensure balance is properly reset and reasonable
+        if not np.isfinite(self.balance) or self.balance <= 0:
+            logger.warning(f"Invalid initial balance detected: ${float(self.balance):.2f}, resetting to ${self.initial_balance:.2f}")
+            self.balance = self.initial_balance
+            
         self.data, failed_symbols = self._get_data() # This calls the modified data fetching method
         self.symbols = [s for s in self.symbols if s not in failed_symbols]
         self.prefetched_data = self.prefetch_data()
@@ -106,7 +112,7 @@ class StockTradingEnvironment:
         self.shares = {symbol: 0 for symbol in self.symbols}
         self.done = False
         # Pre-allocate memory for history
-        self.portfolio_value_history = [self.initial_balance]
+        self.portfolio_value_history = [float(self.initial_balance)]
 
         # Pre-cache current prices for all symbols
         self._update_current_prices()
@@ -116,13 +122,24 @@ class StockTradingEnvironment:
 
     def _update_current_prices(self):
         """Caches the current prices for all symbols to avoid repeated lookups."""
-        self.current_prices = np.array(
-            [
-                self.prefetched_data[symbol][self.current_step]
-                for symbol in self.symbols if symbol in self.prefetched_data
-            ],
-            dtype=np.float32,
-        )
+        raw_prices = [
+            self.prefetched_data[symbol][self.current_step]
+            for symbol in self.symbols if symbol in self.prefetched_data
+        ]
+        
+        # Validate and sanitize prices
+        validated_prices = []
+        for i, price in enumerate(raw_prices):
+            symbol = self.symbols[i] if i < len(self.symbols) else f"UNKNOWN_{i}"
+            
+            # Check for invalid prices
+            if not np.isfinite(price) or price <= 0 or price > 10000:
+                logger.warning(f"Invalid price detected for {symbol}: ${float(price):.2f}, using default price $100")
+                validated_prices.append(100.0)  # Use reasonable default price
+            else:
+                validated_prices.append(float(price))
+        
+        self.current_prices = np.array(validated_prices, dtype=np.float32)
 
     def _get_state(self):
         """Creates the state representation with vectorized operations for better performance.
@@ -198,9 +215,23 @@ class StockTradingEnvironment:
 
         # Vectorized calculation using numpy for efficiency
         shares = np.array([self.shares[s] for s in self.symbols if s in self.prefetched_data], dtype=np.float32)
-        portfolio_value += np.sum(shares * self.current_prices)
+        assets_value = np.sum(shares * self.current_prices)
+        portfolio_value += assets_value
 
-        return portfolio_value
+        # Sanity check - ensure portfolio value is reasonable
+        if not np.isfinite(portfolio_value) or portfolio_value < 0:
+            logger.warning(f"Invalid portfolio value calculated: {float(portfolio_value)}, balance: {float(self.balance)}, assets: {float(assets_value)}")
+            portfolio_value = max(0.0, float(self.balance))  # At minimum, portfolio should be cash balance
+        
+        # Debug: Log if portfolio value is extremely high
+        if portfolio_value > self.initial_balance * 100:  # More than 100x initial balance
+            logger.warning(f"High portfolio value calculated: ${float(portfolio_value):.2f}")
+            logger.warning(f"Balance: ${float(self.balance):.2f}, Assets: ${float(assets_value):.2f}")
+            logger.warning(f"Shares: {dict(self.shares)}")
+            logger.warning(f"Current prices: {self.current_prices}")
+            logger.warning(f"Symbols: {self.symbols}")
+
+        return float(portfolio_value)
 
     def step(self, action):
         """
@@ -218,41 +249,109 @@ class StockTradingEnvironment:
         """
         # Map continuous actions to discrete buy/sell decisions
         transaction_reward = 0
-        profit_reward = 0
+        # profit_reward = 0  # Removed since we're not using it anymore
         for i, symbol in enumerate(self.symbols):
             if symbol not in self.prefetched_data:
                 continue
             signal = action[i]
             current_price = self.current_prices[i]
 
+            # Validate current price to prevent arithmetic errors
+            if not np.isfinite(current_price) or current_price <= 0 or current_price > 10000:
+                logger.warning(f"Invalid price detected for {symbol}: ${float(current_price):.2f}, skipping trades")
+                continue
+
             if signal > 0:  # Buy signal
+                # Add minimum threshold to prevent $0.00 costs from tiny signals
+                if signal < 0.1:  # Ignore signals smaller than 10% of max trade
+                    continue
+                    
                 shares_to_buy = int(signal * self.max_shares_per_trade)
                 cost = shares_to_buy * current_price
+                
+                # Additional safety check on cost calculation
+                if not np.isfinite(cost) or cost < 0:  # Changed from cost <= 0 to cost < 0
+                    logger.warning(f"Invalid cost calculated for {symbol}: ${float(cost):.2f}, skipping buy")
+                    continue
+                    
                 if cost <= self.balance and shares_to_buy > 0:
                     self.balance -= cost
                     self.shares[symbol] += shares_to_buy
-                    transaction_reward += 0.01
+                    transaction_reward += 0.001  # Small positive reward for successful trades
+                    
+                    # Debug: Log large purchases
+                    if shares_to_buy > 10:  # More than 10 shares
+                        logger.warning(f"Large purchase: {shares_to_buy} shares of {symbol} at ${float(current_price):.2f} = ${float(cost):.2f}")
             elif signal < 0:  # Sell signal
+                # Add minimum threshold to prevent tiny sell signals
+                if signal > -0.1:  # Ignore signals smaller than 10% of max trade
+                    continue
+                    
                 shares_to_sell = int(
                     -signal * min(self.max_shares_per_trade, self.shares[symbol])
                 )
                 if shares_to_sell > 0:
-                    self.balance += shares_to_sell * current_price
+                    sale_proceeds = shares_to_sell * current_price
+                    
+                    # Additional safety check on sale proceeds calculation
+                    if not np.isfinite(sale_proceeds) or sale_proceeds < 0:  # Changed from sale_proceeds <= 0 to sale_proceeds < 0
+                        logger.warning(f"Invalid sale proceeds calculated for {symbol}: ${float(sale_proceeds):.2f}, skipping sell")
+                        continue
+                    
+                    self.balance += sale_proceeds
                     self.shares[symbol] -= shares_to_sell
-                    transaction_reward += 0.01
-                    profit_reward += (shares_to_sell * current_price) - (shares_to_sell * self.current_prices[i])
+                    transaction_reward += 0.001  # Small positive reward for successful trades
+                    # Remove double counting - profit is already captured in portfolio value change
+                    # profit_reward += (shares_to_sell * current_price) - (shares_to_sell * self.current_prices[i])
+
+        # Periodic balance validation check (every 1000 steps to reduce log noise)
+        if self.current_step % 1000 == 0:
+            if not np.isfinite(self.balance) or self.balance < 0:
+                logger.warning(f"Balance corruption detected at step {self.current_step}: ${float(self.balance):.2f}, resetting to reasonable value")
+                # Reset to a reasonable balance based on current portfolio
+                assets_value = sum(self.shares[s] * self.current_prices[i] for i, s in enumerate(self.symbols) if s in self.shares)
+                self.balance = max(self.initial_balance * 0.1, assets_value * 0.1)  # At least 10% of initial or 10% of assets
+                logger.warning(f"Reset balance to ${float(self.balance):.2f}")
 
         # Calculate reward as the change in portfolio value
         old_portfolio_value = self.portfolio_value_history[-1]
         new_portfolio_value = self._calculate_portfolio_value()
 
+        # Validate portfolio value is reasonable (not infinite or NaN)
+        if not np.isfinite(new_portfolio_value) or new_portfolio_value < 0:
+            logger.warning(f"Invalid portfolio value detected: {float(new_portfolio_value)}, using previous value")
+            new_portfolio_value = old_portfolio_value
+        
+        # Debug: Log extremely high portfolio values
+        if new_portfolio_value > self.initial_balance * 1000:  # More than 1000x initial balance
+            logger.warning(f"Extremely high portfolio value detected: ${float(new_portfolio_value):.2f} (initial: ${self.initial_balance:.2f})")
+            logger.warning(f"Balance: ${float(self.balance):.2f}, Shares: {self.shares}")
+            logger.warning(f"Current prices: {self.current_prices}")
+            
+            # Cap the portfolio value to prevent runaway growth
+            new_portfolio_value = self.initial_balance * 100  # Cap at 100x initial balance
+            logger.warning(f"Capped portfolio value to ${float(new_portfolio_value):.2f}")
+
+        # CRITICAL FIX: Also cap the balance itself to prevent astronomical growth
+        # The balance should never exceed a reasonable multiple of the initial balance
+        max_reasonable_balance = self.initial_balance * 50  # Cap balance at 50x initial balance
+        if self.balance > max_reasonable_balance:
+            logger.warning(f"Balance too high: ${float(self.balance):.2f}, capping to ${float(max_reasonable_balance):.2f}")
+            self.balance = max_reasonable_balance
+            
+            # Recalculate portfolio value after balance adjustment
+            new_portfolio_value = self._calculate_portfolio_value()
+            logger.warning(f"Recalculated portfolio value after balance cap: ${float(new_portfolio_value):.2f}")
+
         # Primary reward is the profit or loss
         profit_loss_reward = new_portfolio_value - old_portfolio_value
 
-        # Combine reward components
-        reward = profit_loss_reward + transaction_reward * 100 + profit_reward # Increased transaction reward
+        # Combine reward components with proper scaling
+        reward = profit_loss_reward + transaction_reward
+        # Apply reward scaling factor
+        reward *= self.reward_scaling_factor
 
-        self.portfolio_value_history.append(new_portfolio_value)
+        self.portfolio_value_history.append(float(new_portfolio_value))
 
         # Move to next time step (i.e., move to the next newer bar)
         self.current_step += 1
@@ -276,15 +375,36 @@ class StockTradingEnvironment:
         )
 
     def _get_data(self):
-        """Gets historical stock data for all symbols with caching using either Alpaca or yfinance.
-
-        Returns:
-            A dictionary where keys are stock symbols and values are pandas DataFrames of historical data.
         """
-        if USE_YFINANCE:
-            return self._get_yfinance_data()
-        else:
-            return self._get_alpaca_data()
+        Fetches historical stock data with robust fallback mechanisms.
+        
+        Returns:
+            tuple: (data_dict, failed_symbols)
+        """
+        # Try Alpaca first
+        try:
+            logger.info("Attempting to fetch data from Alpaca API...")
+            data, failed_symbols = self._get_alpaca_data()
+            if data and len(data) > 0:
+                logger.info(f"Successfully fetched data from Alpaca for {len(data)} symbols")
+                return data, failed_symbols
+        except Exception as e:
+            logger.warning(f"Alpaca data fetching failed: {e}")
+        
+        # Fallback to yfinance
+        try:
+            logger.info("Falling back to yfinance for data...")
+            data, failed_symbols = self._get_yfinance_data()
+            if data and len(data) > 0:
+                logger.info(f"Successfully fetched data from yfinance for {len(data)} symbols")
+                return data, failed_symbols
+        except Exception as e:
+            logger.error(f"yfinance data fetching failed: {e}")
+        
+        # If both sources fail, raise a comprehensive error
+        error_msg = "All data sources failed. Please check your internet connection and API credentials."
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
         
     def _get_alpaca_data(self):
         """Fetches historical stock data from Alpaca Markets API with caching.

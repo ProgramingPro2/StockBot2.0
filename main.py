@@ -1,5 +1,6 @@
 import numpy as np
 import time
+import sys
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
 from datetime import datetime, timedelta
@@ -57,11 +58,53 @@ tf.config.optimizer.set_jit(True)  # Enable XLA JIT compilation
 # Load environment variables
 dotenv.load_dotenv()
 
-# Connect to Alpaca API
-trading_client = TradingClient(
-    ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER_TRADING
-)
-stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+def check_system_health():
+    """
+    Performs system health checks before starting operations.
+    
+    Returns:
+        bool: True if all checks pass, False otherwise
+    """
+    logger.info("Performing system health checks...")
+    
+    # Check API credentials
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        logger.error("Alpaca API credentials not found. Please set ALPACA_API_KEY and ALPACA_SECRET_KEY in your .env file")
+        return False
+    
+    # Check GPU availability
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        logger.info(f"GPU detected: {len(gpus)} physical GPU(s)")
+    else:
+        logger.warning("No GPU detected. Training will be slower on CPU")
+    
+    # Check required directories
+    required_dirs = ["./models", "./data_cache", "./checkpoints"]
+    for dir_path in required_dirs:
+        Path(dir_path).mkdir(exist_ok=True)
+        logger.info(f"Directory ready: {dir_path}")
+    
+    # Check stock symbols
+    if not STOCK_SYMBOLS:
+        logger.error("No stock symbols configured")
+        return False
+    
+    logger.info(f"Health checks passed. Trading {len(STOCK_SYMBOLS)} symbols")
+    return True
+
+# Connect to Alpaca API with error handling
+try:
+    trading_client = TradingClient(
+        ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER_TRADING
+    )
+    stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    logger.info("Successfully connected to Alpaca API")
+except Exception as e:
+    logger.error(f"Failed to connect to Alpaca API: {e}")
+    logger.error("Please check your API credentials in the .env file")
+    raise
+
 
 def optimize_agent(optimization_episodes=1000, optimization_test_trials=100):
     """
@@ -83,7 +126,7 @@ def optimize_agent(optimization_episodes=1000, optimization_test_trials=100):
         noise_sigma = trial.suggest_float("noise_sigma", 0.05, 0.3)
         noise_theta = trial.suggest_float("noise_theta", 0.1, 0.5)
         reward_scaling_factor = trial.suggest_float(
-            "reward_scaling_factor", 100.0, 5000.0, log=True
+            "reward_scaling_factor", 0.1, 10.0, log=True
         )
 
         # Update global parameters or pass them to the agent
@@ -322,12 +365,15 @@ def train_agent():
     return agent
 
 
-def test_agent(agent=None):
+def test_agent(agent=None, episodes=None):
     """Tests the trained agent.
 
     Args:
         agent: The DRLAgent instance to test. If None, a new agent is initialized and models are loaded.
+        episodes: Number of episodes to test. If None, uses TEST_EPISODES from config.
     """
+    if episodes is None:
+        episodes = TEST_EPISODES
     if agent is None:
         agent = DRLAgent(
             STATE_DIM,
@@ -347,7 +393,7 @@ def test_agent(agent=None):
     total_rewards = []
     portfolio_values = []
 
-    for episode in tqdm(range(TEST_EPISODES), desc="Testing Progress"):
+    for episode in tqdm(range(episodes), desc="Testing Progress"):
         state = env.reset()
         total_reward = 0.0
         done = False
@@ -366,7 +412,7 @@ def test_agent(agent=None):
 
         if episode % 10 == 0:  # Print only every 10 episodes to reduce output
             logger.info(
-                f"Test Episode {episode + 1}/{TEST_EPISODES}, Final Reward: {total_reward:.6f}, Final Portfolio Value: {info['portfolio_value'].item():.2f}"
+                f"Test Episode {episode + 1}/{episodes}, Final Reward: {total_reward:.6f}, Final Portfolio Value: {float(info['portfolio_value']):.2f}"
             )
 
     # Calculate statistics
@@ -389,7 +435,33 @@ def test_agent(agent=None):
     max_len = max(len(p) for p in portfolio_values)
 
     # Align all portfolio histories to the maximum length for accurate averaging
-    aligned_portfolios = [np.pad(p, (0, max_len - len(p)), 'edge') for p in portfolio_values]
+    aligned_portfolios = []
+    for p in portfolio_values:
+        try:
+            # Ensure p is a flat list/array and handle any conversion issues
+            if isinstance(p, (list, tuple)):
+                # Flatten the list if it contains nested structures
+                p_flat = []
+                for item in p:
+                    if isinstance(item, (list, tuple)):
+                        p_flat.extend(item)
+                    else:
+                        p_flat.append(float(item))
+                p_array = np.array(p_flat, dtype=np.float64)
+            else:
+                p_array = np.array(p, dtype=np.float64)
+            
+            # Ensure it's 1D
+            if p_array.ndim > 1:
+                p_array = p_array.flatten()
+            
+            padded = np.pad(p_array, (0, max_len - len(p_array)), 'edge')
+            aligned_portfolios.append(padded)
+        except Exception as e:
+            logger.warning(f"Error processing portfolio values: {e}, using default")
+            # Use a default array if processing fails
+            default_array = np.full(max_len, INITIAL_BALANCE, dtype=np.float64)
+            aligned_portfolios.append(default_array)
 
     # Plot average portfolio value
     avg_portfolio = np.mean(aligned_portfolios, axis=0)
@@ -619,6 +691,12 @@ if __name__ == "__main__":
         help="Number of epochs for training",
     )
     parser.add_argument(
+        "--episodes",
+        type=int,
+        default=TEST_EPISODES,
+        help="Number of episodes for testing",
+    )
+    parser.add_argument(
         "--trials",
         type=int,
         default=100,
@@ -651,6 +729,11 @@ if __name__ == "__main__":
 
     # Run in the specified mode
     try:
+        # Perform health checks before starting
+        if not check_system_health():
+            logger.error("System health checks failed. Exiting.")
+            sys.exit(1)
+        
         if args.mode == "train":
             logger.info("Training agent...")
             logger.info(f"Number of epochs: {args.epochs}")
@@ -658,7 +741,8 @@ if __name__ == "__main__":
             agent = train_agent()
         elif args.mode == "test":
             logger.info("Testing agent...")
-            test_agent()
+            logger.info(f"Number of test episodes: {args.episodes}")
+            test_agent(episodes=args.episodes)
         elif args.mode == "live":
             logger.info("Starting live trading...")
             run_live_trading()

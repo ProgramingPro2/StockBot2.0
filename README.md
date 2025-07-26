@@ -36,12 +36,13 @@ A sophisticated algorithmic trading system that uses Deep Reinforcement Learning
 
 ### Configuration & Data
 
-| File                   | Purpose               | Contents                                                |
-| ---------------------- | --------------------- | ------------------------------------------------------- |
-| `config.py`            | Central configuration | API keys, trading parameters, model hyperparameters     |
-| `stocks.json`          | Trading universe      | List of stock symbols to trade (27 major stocks)        |
-| `requirements.txt`     | Dependencies          | Python packages including TensorFlow, Alpaca-py, Optuna |
-| `market_automation.sh` | Automation script     | Cron job setup for automated trading and training       |
+| File                   | Purpose               | Contents                                                           |
+| ---------------------- | --------------------- | ------------------------------------------------------------------ |
+| `config.py`            | Central configuration | API keys, trading parameters, model hyperparameters                |
+| `stocks.json`          | Trading universe      | List of stock symbols to trade (27 major stocks)                   |
+| `requirements.txt`     | Dependencies          | Python packages including TensorFlow, Alpaca-py, Optuna            |
+| `market_automation.sh` | Automation script     | Cron job setup for automated trading and training                  |
+| `setup_env.py`         | Environment setup     | Interactive script to configure API credentials and validate setup |
 
 ## 🧠 Architecture Overview
 
@@ -105,8 +106,13 @@ Handles real-time trading execution:
    ```
 
 4. **Configure environment:**
+
    ```bash
-   cp .env.example .env
+   # Run the setup script to configure your environment
+   python setup_env.py
+
+   # Or manually create .env file:
+   # cp .env.example .env
    # Edit .env with your Alpaca API credentials
    ```
 
@@ -125,12 +131,13 @@ python main.py --mode train --epochs 1000 --gpu
 ### Testing Mode
 
 ```bash
-python main.py --mode test
+python main.py --mode test --episodes 50
 ```
 
 - Evaluates trained agent on unseen data
 - Generates performance visualizations
 - Creates `test_results.png` and `final_values_distribution.png`
+- Use `--episodes` to control number of test episodes (default: 100)
 
 ### Hyperparameter Optimization
 
