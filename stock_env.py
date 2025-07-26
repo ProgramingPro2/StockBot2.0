@@ -16,12 +16,6 @@ import yfinance as yf
 # Ensure config.py is correctly set up with your keys
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, USE_YFINANCE
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    filename="app.log",
-    filemode="a"
-)
 logger = logging.getLogger(__name__)
 
 class StockTradingEnvironment:

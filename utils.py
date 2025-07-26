@@ -1,13 +1,9 @@
+import os
+from pathlib import Path
 import logging
 from datetime import datetime, timedelta
 from config import STOCK_SYMBOLS, CACHE_DIR
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    filename="app.log",
-    filemode="a"
-)
 logger = logging.getLogger(__name__)
 
 def invalidate_cache(symbols=None, days=1):
@@ -39,11 +35,20 @@ def invalidate_cache(symbols=None, days=1):
         if not symbol_match:
             continue
 
-        # Check file modification time
-        mod_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
-        if mod_time < cutoff_time:
-            cache_file.unlink()  # Delete the file
-            invalidated_count += 1
-            logger.info(f"Invalidated cache file: {cache_file.name}")
+        # Check if file still exists before trying to access it
+        if not cache_file.exists():
+            continue
+
+        try:
+            # Check file modification time
+            mod_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
+            if mod_time < cutoff_time:
+                cache_file.unlink()  # Delete the file
+                invalidated_count += 1
+                logger.info(f"Invalidated cache file: {cache_file.name}")
+        except (FileNotFoundError, OSError) as e:
+            # File might have been deleted by another process or is inaccessible
+            logger.debug(f"Could not access cache file {cache_file.name}: {e}")
+            continue
 
     logger.info(f"Cache invalidation complete. Removed {invalidated_count} files.")

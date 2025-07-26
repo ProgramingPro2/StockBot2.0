@@ -20,17 +20,16 @@ from drl_agent import DRLAgent
 from stock_env import StockTradingEnvironment
 from alpaca_trade_system import AlpacaTradingSystem
 
-# Clear app.log
+# Clear app.log properly
 if Path("app.log").exists():
-    with open("app.log", "w") as f:
-        f.write("")  # Clear the log file
+    Path("app.log").unlink()  # Remove the file completely
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     filename="app.log",
-    filemode="a" # Use 'a' for append mode
+    filemode="w"  # Use 'w' for write mode to start fresh
 )
 logger = logging.getLogger(__name__)
 
