@@ -87,15 +87,15 @@ if os.path.exists("stocks.json"):
         except Exception as e:
             logger.error(f"Error loading stock symbols from stocks.json: {e}")
 
-# RL model parameters
+# RL model parameters - Optimized for performance
 STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)
 ACTION_DIM = len(STOCK_SYMBOLS)
-LEARNING_RATE = 0.0001
-GAMMA = 0.95
-BATCH_SIZE = 4096  # For max GPU utilization on RTX 3090 (with mixed precision)
-MEMORY_SIZE = 100000  # Increased for better training stability
-NOISE_SIGMA = 0.15
-NOISE_THETA = 0.2
+LEARNING_RATE = 0.0003  # Slightly higher for faster convergence
+GAMMA = 0.99  # Higher discount factor for better long-term planning
+BATCH_SIZE = 8192  # Larger batch size for better GPU utilization
+MEMORY_SIZE = 200000  # Larger memory for more diverse experiences
+NOISE_SIGMA = 0.1  # Reduced noise for more stable training
+NOISE_THETA = 0.15  # Reduced theta for faster noise decay
 
 # Load hyperparameters if available
 hyperparams_path = Path("./hyperparameters.json")

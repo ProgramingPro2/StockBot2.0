@@ -8,3 +8,7 @@ joblib
 tqdm
 optuna
 ruff
+psutil
+GPUtil
+yfinance
+requests

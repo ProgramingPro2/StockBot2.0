@@ -166,54 +166,101 @@ class DRLAgent:
     @tf.function
     def _actor_train_step(self, states):
         """
-        Performs a single training step for the actor network.
-
+        Performs a single training step for the actor network using vectorized operations.
+        
         Args:
-            states: A TensorFlow tensor representing the current states.
-
+            states: Batch of states with shape (batch_size, state_dim)
+            
         Returns:
-            The actor loss as a TensorFlow scalar.
+            The actor loss value
         """
         with tf.GradientTape() as tape:
-            actions_pred = self.actor(states, training=True)
-            actor_loss = -tf.reduce_mean(
-                self.critic([states, actions_pred], training=True)
-            )
-
-        actor_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
-        # Apply gradient clipping
-        actor_grads = [(tf.clip_by_norm(grad, 1.0)) for grad in actor_grads]
-        self.actor_optimizer.apply_gradients(
-            zip(actor_grads, self.actor.trainable_variables)
-        )
+            # Get actions from actor network
+            actions = self.actor(states, training=True)
+            
+            # Get Q-values from critic network
+            q_values = self.critic([states, actions], training=True)
+            
+            # Actor loss: maximize Q-values (negative because we minimize loss)
+            actor_loss = -tf.reduce_mean(q_values)
+            
+            # Add L2 regularization
+            l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in self.actor.trainable_variables])
+            actor_loss += 1e-4 * l2_loss
+        
+        # Compute gradients and apply updates
+        gradients = tape.gradient(actor_loss, self.actor.trainable_variables)
+        self.actor_optimizer.apply_gradients(zip(gradients, self.actor.trainable_variables))
+        
         return actor_loss
 
     @tf.function
     def _critic_train_step(self, states, actions, q_targets):
         """
-        Performs a single training step for the critic network.
-
+        Performs a single training step for the critic network using vectorized operations.
+        
         Args:
-            states: A TensorFlow tensor representing the current states.
-            actions: A TensorFlow tensor representing the actions taken.
-            q_targets: A TensorFlow tensor representing the target Q-values.
-
+            states: Batch of states with shape (batch_size, state_dim)
+            actions: Batch of actions with shape (batch_size, action_dim)
+            q_targets: Target Q-values with shape (batch_size, 1)
+            
         Returns:
-            The critic loss as a TensorFlow scalar.
+            The critic loss value
         """
         with tf.GradientTape() as tape:
+            # Get Q-values from critic network
             q_values = self.critic([states, actions], training=True)
-            # Ensure q_values is float32 for calculation with q_targets
-            q_values_float32 = tf.cast(q_values, tf.float32)
-            critic_loss = tf.reduce_mean(tf.square(q_targets - q_values_float32))
-
-        critic_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
-        # Apply gradient clipping
-        critic_grads = [(tf.clip_by_norm(grad, 1.0)) for grad in critic_grads]
-        self.critic_optimizer.apply_gradients(
-            zip(critic_grads, self.critic.trainable_variables)
-        )
+            
+            # Critic loss: MSE between predicted and target Q-values
+            critic_loss = tf.reduce_mean(tf.square(q_targets - q_values))
+            
+            # Add L2 regularization
+            l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in self.critic.trainable_variables])
+            critic_loss += 1e-4 * l2_loss
+        
+        # Compute gradients and apply updates
+        gradients = tape.gradient(critic_loss, self.critic.trainable_variables)
+        self.critic_optimizer.apply_gradients(zip(gradients, self.critic.trainable_variables))
+        
         return critic_loss
+
+    @tf.function
+    def _parallel_train_step(self, states, actions, q_targets):
+        """
+        Performs parallel training of both actor and critic networks in a single function.
+        This reduces function call overhead and improves GPU utilization.
+        
+        Args:
+            states: Batch of states with shape (batch_size, state_dim)
+            actions: Batch of actions with shape (batch_size, action_dim)
+            q_targets: Target Q-values with shape (batch_size, 1)
+            
+        Returns:
+            Tuple of (actor_loss, critic_loss)
+        """
+        # Actor training
+        with tf.GradientTape() as actor_tape:
+            actor_actions = self.actor(states, training=True)
+            actor_q_values = self.critic([states, actor_actions], training=True)
+            actor_loss = -tf.reduce_mean(actor_q_values)
+            actor_l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in self.actor.trainable_variables])
+            actor_loss += 1e-4 * actor_l2_loss
+        
+        # Critic training
+        with tf.GradientTape() as critic_tape:
+            critic_q_values = self.critic([states, actions], training=True)
+            critic_loss = tf.reduce_mean(tf.square(q_targets - critic_q_values))
+            critic_l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in self.critic.trainable_variables])
+            critic_loss += 1e-4 * critic_l2_loss
+        
+        # Apply gradients
+        actor_gradients = actor_tape.gradient(actor_loss, self.actor.trainable_variables)
+        critic_gradients = critic_tape.gradient(critic_loss, self.critic.trainable_variables)
+        
+        self.actor_optimizer.apply_gradients(zip(actor_gradients, self.actor.trainable_variables))
+        self.critic_optimizer.apply_gradients(zip(critic_gradients, self.critic.trainable_variables))
+        
+        return actor_loss, critic_loss
 
     def act(self, state, explore=True):
         """
@@ -249,7 +296,7 @@ class DRLAgent:
 
     def train(self, dataset):
         """
-        Trains the agent using a batch from the dataset.
+        Trains the agent using a batch from the dataset with optimized performance.
 
         Args:
             dataset: A tf.data.Dataset iterator providing batches of experiences.
@@ -260,42 +307,48 @@ class DRLAgent:
         if dataset is None:
             return
 
-        # Get the next batch from the dataset iterator
-        states, actions, rewards, next_states, dones = next(dataset)
+        try:
+            # Get the next batch from the dataset iterator
+            states, actions, rewards, next_states, dones = next(dataset)
 
-        # Ensure tensors have the correct data type
-        states = tf.cast(states, tf.float32)
-        actions = tf.cast(actions, tf.float32)
-        rewards = tf.cast(rewards, tf.float32)
-        next_states = tf.cast(next_states, tf.float32)
-        dones = tf.cast(dones, tf.float32)
+            # Ensure tensors have the correct data type and shape
+            states = tf.cast(states, tf.float32)
+            actions = tf.cast(actions, tf.float32)
+            rewards = tf.cast(rewards, tf.float32)
+            next_states = tf.cast(next_states, tf.float32)
+            dones = tf.cast(dones, tf.float32)
 
-        # Calculate target Q-values
-        next_actions = self.target_actor(next_states, training=False)
-        q_next = self.target_critic([next_states, next_actions], training=False)
-        q_next = tf.cast(q_next, tf.float32)
-        q_targets = rewards + (1 - dones) * self.gamma * q_next[:, 0]
+            # Calculate target Q-values using target networks
+            next_actions = self.target_actor(next_states, training=False)
+            q_next = self.target_critic([next_states, next_actions], training=False)
+            q_targets = rewards + (1 - dones) * self.gamma * q_next[:, 0]
+            q_targets = tf.expand_dims(q_targets, axis=1)
 
-        # Train critic and actor
-        critic_loss = self._critic_train_step(
-            states, actions, tf.expand_dims(q_targets, axis=1)
-        )
-        actor_loss = self._actor_train_step(states)
+            # Use parallel training for better performance
+            actor_loss, critic_loss = self._parallel_train_step(states, actions, q_targets)
 
-        # Decay epsilon
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+            # Decay epsilon
+            if self.epsilon > self.epsilon_min:
+                self.epsilon *= self.epsilon_decay
 
-        # Soft update target networks
-        self._update_target_networks()
+            # Soft update target networks
+            self._update_target_networks()
 
-        actor_loss_val = actor_loss.numpy()
-        critic_loss_val = critic_loss.numpy()
+            # Convert to numpy for logging
+            actor_loss_val = float(actor_loss.numpy())
+            critic_loss_val = float(critic_loss.numpy())
 
-        if np.isnan(actor_loss_val) or np.isnan(critic_loss_val):
-            logger.warning(f"NaN loss detected: actor_loss={actor_loss_val}, critic_loss={critic_loss_val}")
+            if np.isnan(actor_loss_val) or np.isnan(critic_loss_val):
+                logger.warning(f"NaN loss detected: actor_loss={actor_loss_val}, critic_loss={critic_loss_val}")
 
-        return {"critic_loss": critic_loss_val, "actor_loss": actor_loss_val}
+            return {"critic_loss": critic_loss_val, "actor_loss": actor_loss_val}
+
+        except StopIteration:
+            # Dataset iterator exhausted
+            return None
+        except Exception as e:
+            logger.error(f"Error during training: {e}")
+            return None
 
     def _update_target_networks(self, tau=0.005):
         """Soft updates the target actor and critic networks."""

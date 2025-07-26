@@ -52,7 +52,7 @@ class ReplayBuffer:
 
     def as_dataset(self, batch_size):
         """
-        Creates a tf.data.Dataset from the replay buffer.
+        Creates a tf.data.Dataset from the replay buffer with optimized performance.
 
         Args:
             batch_size: The batch size for the dataset.
@@ -63,26 +63,26 @@ class ReplayBuffer:
         if self.size == 0:
             return None
 
-        # Create a dataset from the stored transitions
+        # Create tensors directly from numpy arrays for better performance
+        states_tensor = tf.convert_to_tensor(self.states[:self.size], dtype=tf.float32)
+        actions_tensor = tf.convert_to_tensor(self.actions[:self.size], dtype=tf.float32)
+        rewards_tensor = tf.convert_to_tensor(self.rewards[:self.size], dtype=tf.float32)
+        next_states_tensor = tf.convert_to_tensor(self.next_states[:self.size], dtype=tf.float32)
+        dones_tensor = tf.convert_to_tensor(self.dones[:self.size], dtype=tf.float32)
+
+        # Create dataset with optimized settings
         dataset = tf.data.Dataset.from_tensor_slices(
-            (
-                self.states[: self.size],
-                self.actions[: self.size],
-                self.rewards[: self.size],
-                self.next_states[: self.size],
-                self.dones[: self.size],
-            )
+            (states_tensor, actions_tensor, rewards_tensor, next_states_tensor, dones_tensor)
         )
 
-        # Shuffle, repeat, and batch the data
+        # Optimize dataset pipeline for better performance
         dataset = (
-            dataset.shuffle(buffer_size=self.size, reshuffle_each_iteration=True)
-            .repeat()
-            .batch(batch_size)
+            dataset
+            .shuffle(buffer_size=min(self.size, 10000), reshuffle_each_iteration=True)
+            .batch(batch_size, drop_remainder=True)  # Drop remainder for consistent batch sizes
+            .prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+            .cache()  # Cache the dataset in memory for faster access
         )
-
-        # Prefetch data to the GPU
-        dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
 
         return dataset
 
