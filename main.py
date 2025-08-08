@@ -129,7 +129,7 @@ stock_data_client = None
 # Removed optimization function - use unified training instead
 
 
-def train_agent():
+def train_agent(debug=False):
     """Unified training pipeline with monitoring, checkpointing, and testing."""
     # Start performance monitoring
     monitor = PerformanceMonitor(log_interval=10)
@@ -140,7 +140,7 @@ def train_agent():
     
     invalidate_cache(days=0)
     StockTradingEnvironment.clear_in_memory_cache()
-    env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR)
+    env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR, debug=debug)
     agent = DRLAgent(
         STATE_DIM,
         ACTION_DIM,
@@ -360,7 +360,7 @@ def optimize_agent(trials=20):
         return None
 
 
-def test_agent(agent=None, episodes=None):
+def test_agent(agent=None, episodes=None, debug=False):
     """Tests the trained agent.
 
     Args:
@@ -383,7 +383,7 @@ def test_agent(agent=None, episodes=None):
 
     invalidate_cache(days=0)
     StockTradingEnvironment.clear_in_memory_cache()
-    env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR)
+    env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR, debug=debug)
 
     total_rewards = []
     portfolio_values = []
@@ -628,6 +628,7 @@ if __name__ == "__main__":
         default="train",
         help="Operation mode: train, test, live trading, or optimize",
     )
+    parser.add_argument("--debug", action="store_true", help="Enable detailed debugging output")
     parser.add_argument("--api_key", type=str, help="Alpaca API Key")
     parser.add_argument("--api_secret", type=str, help="Alpaca API Secret Key")
     parser.add_argument(
@@ -684,11 +685,11 @@ if __name__ == "__main__":
             logger.info("Training agent...")
             logger.info(f"Number of epochs: {args.epochs}")
             TRAINING_EPISODES = args.epochs
-            agent = train_agent()
+            agent = train_agent(debug=args.debug)
         elif args.mode == "test":
             logger.info("Testing agent...")
             logger.info(f"Number of test episodes: {args.episodes}")
-            test_agent(episodes=args.episodes)
+            test_agent(episodes=args.episodes, debug=args.debug)
         elif args.mode == "live":
             logger.info("Starting live trading...")
             run_live_trading()

@@ -32,7 +32,7 @@ class StockTradingEnvironment:
         StockTradingEnvironment._global_data_cache.clear()
         logger.info("In-memory data cache cleared.")
 
-    def __init__(self, symbols, initial_balance, lookback_window, stock_data_client, cache_dir, max_shares_per_trade, reward_scaling_factor):
+    def __init__(self, symbols, initial_balance, lookback_window, stock_data_client, cache_dir, max_shares_per_trade, reward_scaling_factor, debug=False):
         """
         Initializes the StockTradingEnvironment.
 
@@ -54,6 +54,7 @@ class StockTradingEnvironment:
         self.cache_dir = cache_dir
         self.max_shares_per_trade = max_shares_per_trade
         self.reward_scaling_factor = reward_scaling_factor
+        self.debug = debug
 
         # Instance-level cache reference
         self.data_cache = {}
@@ -375,15 +376,31 @@ class StockTradingEnvironment:
             try:
                 current_prices_array = np.array([self.current_prices[symbol] for symbol in self.symbols], dtype=np.float32)
                 balance_tensor, shares_tensor = self._execute_trades_gpu(action, current_prices_array)
+                # Update both CPU and GPU values
                 self.balance = float(balance_tensor.numpy())
                 self.shares = {symbol: float(shares_tensor[i].numpy()) for i, symbol in enumerate(self.symbols)}
                 self.balance_tensor = balance_tensor
                 self.shares_tensor = shares_tensor
+                # Ensure GPU tensors are in sync
+                with tf.device(self.device):
+                    self.balance_tensor = tf.constant(self.balance, dtype=tf.float32)
+                    self.shares_tensor = tf.constant([self.shares[symbol] for symbol in self.symbols], dtype=tf.float32)
             except Exception as e:
                 logger.warning(f"GPU trading failed, falling back to CPU: {e}")
                 self._execute_trades_cpu(action)
         else:
             self._execute_trades_cpu(action)
+            
+        # Debug: Log trading details
+        if self.debug:
+            logger.info(f"=== STEP {self.current_step} DEBUG ===")
+            logger.info(f"Actions: {action}")
+            logger.info(f"Current Prices: {self.current_prices}")
+            logger.info(f"Balance: ${self.balance:.2f}")
+            logger.info(f"Shares: {self.shares}")
+            logger.info(f"Portfolio Value: ${self._calculate_portfolio_value():.2f}")
+            logger.info(f"Initial Balance: ${self.initial_balance:.2f}")
+            logger.info(f"Return: {((self._calculate_portfolio_value() - self.initial_balance) / self.initial_balance * 100):.2f}%")
 
         # Move to next step
         self.current_step += 1
@@ -394,9 +411,11 @@ class StockTradingEnvironment:
         # Calculate reward - only give reward at the end of episode
         if done:
             final_portfolio_value = self._calculate_portfolio_value()
-            # Calculate percentage return instead of absolute difference
+            # Calculate percentage return with bounds to prevent unrealistic values
             if self.initial_balance > 0:
                 percentage_return = (final_portfolio_value - self.initial_balance) / self.initial_balance
+                # Clamp percentage return to reasonable bounds (-0.5 to 2.0 = -50% to +200%)
+                percentage_return = np.clip(percentage_return, -0.5, 2.0)
                 reward = percentage_return * self.reward_scaling_factor
             else:
                 reward = 0.0
@@ -405,9 +424,18 @@ class StockTradingEnvironment:
             current_portfolio_value = self._calculate_portfolio_value()
             if self.initial_balance > 0:
                 current_return = (current_portfolio_value - self.initial_balance) / self.initial_balance
-                reward = current_return * 0.01  # Small intermediate reward
+                # Clamp intermediate returns too
+                current_return = np.clip(current_return, -0.5, 2.0)
+                reward = current_return * 0.001  # Much smaller intermediate reward
             else:
                 reward = 0.0
+                
+        # Debug: Log reward calculation
+        if self.debug:
+            if done:
+                logger.info(f"FINAL REWARD: {reward:.6f} (Portfolio: ${final_portfolio_value:.2f}, Return: {percentage_return*100:.2f}%)")
+            else:
+                logger.info(f"INTERMEDIATE REWARD: {reward:.6f} (Portfolio: ${current_portfolio_value:.2f}, Return: {current_return*100:.2f}%)")
 
         # Get next state
         next_state = self._get_state()
@@ -444,8 +472,11 @@ class StockTradingEnvironment:
             if not isinstance(current_prices, tf.Tensor):
                 current_prices = tf.convert_to_tensor(current_prices, dtype=tf.float32)
             
-            # Calculate trade amounts
+            # Calculate trade amounts with limits to prevent excessive trading
             trade_amounts = action_tensor * self.max_shares_per_trade
+            # Limit trade amounts to prevent excessive portfolio growth
+            max_trade_amount = 10.0  # Maximum shares per trade
+            trade_amounts = tf.clip_by_value(trade_amounts, -max_trade_amount, max_trade_amount)
             
             # Don't allow buying if balance is zero (tensor-safe)
             balance_nonpos = tf.less_equal(self.balance_tensor, 0.0)
@@ -479,12 +510,18 @@ class StockTradingEnvironment:
         Args:
             action: Action array
         """
+        if self.debug:
+            logger.info(f"CPU TRADING - Initial Balance: ${self.balance:.2f}, Shares: {self.shares}")
+            
         for i, symbol in enumerate(self.symbols):
             if symbol not in self.current_prices:
                 continue
                 
             current_price = self.current_prices[symbol]
             trade_amount = action[i] * self.max_shares_per_trade
+            # Limit trade amounts to prevent excessive portfolio growth
+            max_trade_amount = 10.0  # Maximum shares per trade
+            trade_amount = np.clip(trade_amount, -max_trade_amount, max_trade_amount)
             
             # Don't allow buying if balance is zero
             if self.balance <= 0 and trade_amount > 0:
@@ -501,12 +538,23 @@ class StockTradingEnvironment:
                 trade_cost = trade_amount * current_price
             
             # Execute the trade
+            old_balance = self.balance
+            old_shares = self.shares[symbol]
             self.balance -= trade_cost
             self.shares[symbol] += trade_amount
             
             # Prevent negative balance and shares
             self.balance = max(self.balance, 0.0)
             self.shares[symbol] = max(self.shares[symbol], 0.0)
+            
+            # Debug: Log individual trades
+            if self.debug and trade_amount != 0:
+                logger.info(f"TRADE {symbol}: {trade_amount:+.2f} shares @ ${current_price:.2f} = ${trade_cost:+.2f}")
+                logger.info(f"  Balance: ${old_balance:.2f} -> ${self.balance:.2f}")
+                logger.info(f"  Shares: {old_shares:.2f} -> {self.shares[symbol]:.2f}")
+                
+        if self.debug:
+            logger.info(f"CPU TRADING - Final Balance: ${self.balance:.2f}, Shares: {self.shares}")
 
     def _calculate_portfolio_value(self):
         """
@@ -520,19 +568,40 @@ class StockTradingEnvironment:
         
         # Use GPU acceleration if available
         if self.device == '/GPU:0':
-            with tf.device(self.device):
-                current_prices_array = np.array([self.current_prices[symbol] for symbol in self.symbols], dtype=np.float32)
-                current_prices_tensor = tf.convert_to_tensor(current_prices_array, dtype=tf.float32)
-                self.shares_tensor = tf.convert_to_tensor([self.shares[symbol] for symbol in self.symbols], dtype=tf.float32)
-                portfolio_value = self._calculate_portfolio_value_gpu(current_prices_tensor)
-                return float(portfolio_value.numpy())
+            try:
+                with tf.device(self.device):
+                    current_prices_array = np.array([self.current_prices[symbol] for symbol in self.symbols], dtype=np.float32)
+                    current_prices_tensor = tf.convert_to_tensor(current_prices_array, dtype=tf.float32)
+                    # Ensure shares tensor is up to date
+                    shares_array = np.array([self.shares[symbol] for symbol in self.symbols], dtype=np.float32)
+                    self.shares_tensor = tf.convert_to_tensor(shares_array, dtype=tf.float32)
+                    portfolio_value = self._calculate_portfolio_value_gpu(current_prices_tensor)
+                    portfolio_value = float(portfolio_value.numpy())
+            except Exception as e:
+                logger.warning(f"GPU portfolio calculation failed, falling back to CPU: {e}")
+                # Fall back to CPU calculation
+                portfolio_value = self.balance
+                for symbol in self.symbols:
+                    if symbol in self.current_prices:
+                        portfolio_value += self.shares[symbol] * self.current_prices[symbol]
         else:
             # CPU fallback
             portfolio_value = self.balance
             for symbol in self.symbols:
                 if symbol in self.current_prices:
                     portfolio_value += self.shares[symbol] * self.current_prices[symbol]
-            return portfolio_value
+        
+        # Debug: Log portfolio calculation details
+        if self.debug:
+            logger.info(f"PORTFOLIO CALCULATION:")
+            logger.info(f"  Cash Balance: ${self.balance:.2f}")
+            for symbol in self.symbols:
+                if symbol in self.current_prices and self.shares[symbol] > 0:
+                    stock_value = self.shares[symbol] * self.current_prices[symbol]
+                    logger.info(f"  {symbol}: {self.shares[symbol]:.2f} shares @ ${self.current_prices[symbol]:.2f} = ${stock_value:.2f}")
+            logger.info(f"  TOTAL PORTFOLIO: ${portfolio_value:.2f}")
+            
+        return portfolio_value
 
     def _get_data(self):
         """
@@ -744,7 +813,7 @@ class StockTradingEnvironment:
         """
         # Convert and cache frequently accessed data for faster access
         prefetched_data = {}
-        for symbol in self.data.keys():
+        for symbol in self.symbols:
             try:
                 # Check for different possible column names
                 symbol_data = self.data[symbol]
