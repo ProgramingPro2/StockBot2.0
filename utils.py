@@ -1,54 +1,38 @@
 import os
-from pathlib import Path
+import shutil
 import logging
-from datetime import datetime, timedelta
-from config import STOCK_SYMBOLS, CACHE_DIR
+import tensorflow as tf
+import numpy as np
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-def invalidate_cache(symbols=None, days=1):
+def invalidate_cache(days=1):
     """
-    Invalidates cache files for the specified symbols or all symbols
-    that are older than the specified number of days.
-
+    Invalidates the data cache by removing files older than specified days.
+    
     Args:
-        symbols: List of symbols to invalidate cache for, or None for all.
-        days: Number of days to consider for cache invalidation.
+        days: Number of days after which cache files are considered stale.
     """
-    if symbols is None:
-        symbols = STOCK_SYMBOLS
+    cache_dir = Path("./data_cache")
+    if not cache_dir.exists():
+        return
+    
+    import time
+    current_time = time.time()
+    cutoff_time = current_time - (days * 24 * 60 * 60)
+    
+    removed_count = 0
+    for file_path in cache_dir.rglob("*"):
+        if file_path.is_file():
+            if file_path.stat().st_mtime < cutoff_time:
+                try:
+                    file_path.unlink()
+                    removed_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to remove cache file {file_path}: {e}")
+    
+    if removed_count > 0:
+        logger.info(f"Removed {removed_count} stale cache files")
 
-    # Get current date
-    now = datetime.now()
-    cutoff_time = now - timedelta(days=days)
-
-    invalidated_count = 0
-
-    for cache_file in CACHE_DIR.glob("*.pkl"):
-        # Only process files for the specified symbols
-        symbol_match = False
-        for symbol in symbols:
-            if symbol in cache_file.name:
-                symbol_match = True
-                break
-
-        if not symbol_match:
-            continue
-
-        # Check if file still exists before trying to access it
-        if not cache_file.exists():
-            continue
-
-        try:
-            # Check file modification time
-            mod_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
-            if mod_time < cutoff_time:
-                cache_file.unlink()  # Delete the file
-                invalidated_count += 1
-                logger.info(f"Invalidated cache file: {cache_file.name}")
-        except (FileNotFoundError, OSError) as e:
-            # File might have been deleted by another process or is inaccessible
-            logger.debug(f"Could not access cache file {cache_file.name}: {e}")
-            continue
-
-    logger.info(f"Cache invalidation complete. Removed {invalidated_count} files.")
+# Removed unused GPU utility functions

@@ -15,22 +15,22 @@ ALPACA_PAPER_TRADING = os.getenv("ALPACA_PAPER_TRADING", "True").lower() == "tru
 
 def validate_config():
     """
-    Validates the configuration and raises errors for missing or invalid settings.
+    Validates configuration values. API keys are optional unless running live trading.
     """
     errors = []
-    
-    # Check API credentials
+
+    # API credentials are optional for training/testing (yfinance path). Warn if missing.
     if not ALPACA_API_KEY:
-        errors.append("ALPACA_API_KEY not found in environment variables")
+        logger.warning("ALPACA_API_KEY not set. This is required only for live trading or Alpaca data.")
     if not ALPACA_SECRET_KEY:
-        errors.append("ALPACA_SECRET_KEY not found in environment variables")
-    
+        logger.warning("ALPACA_SECRET_KEY not set. This is required only for live trading or Alpaca data.")
+
     # Check stock symbols
     if not STOCK_SYMBOLS:
         errors.append("No stock symbols configured")
     elif len(STOCK_SYMBOLS) == 0:
         errors.append("Stock symbols list is empty")
-    
+
     # Check other critical parameters
     if INITIAL_BALANCE <= 0:
         errors.append("Initial balance must be positive")
@@ -38,12 +38,12 @@ def validate_config():
         errors.append("Lookback window must be positive")
     if MAX_SHARES_PER_TRADE <= 0:
         errors.append("Max shares per trade must be positive")
-    
+
     if errors:
         error_msg = "Configuration validation failed:\n" + "\n".join(f"- {error}" for error in errors)
         logger.error(error_msg)
         raise ValueError(error_msg)
-    
+
     logger.info("Configuration validation passed")
     logger.info(f"Trading {len(STOCK_SYMBOLS)} symbols with ${INITIAL_BALANCE} initial balance")
     logger.info(f"Paper trading enabled: {ALPACA_PAPER_TRADING}")
@@ -65,9 +65,9 @@ INITIAL_BALANCE = 1000.0
 LOOKBACK_WINDOW = 168
 TRADING_FREQUENCY = "hourly"
 MAX_SHARES_PER_TRADE = 5
-TRAINING_EPISODES = 1000
-TEST_EPISODES = 100
-REWARD_SCALING_FACTOR = 1.0  # Reduced from 100.0 to prevent unrealistic rewards
+TRAINING_EPISODES = 500  # Reduced from 1000 for faster training
+TEST_EPISODES = 50  # Reduced from 100 for faster testing
+REWARD_SCALING_FACTOR = 0.1  # Reduced to prevent unrealistic rewards and stabilize training
 
 if os.path.exists("stocks.json"):
     with open("stocks.json", "r") as f:
@@ -87,15 +87,15 @@ if os.path.exists("stocks.json"):
         except Exception as e:
             logger.error(f"Error loading stock symbols from stocks.json: {e}")
 
-# RL model parameters - Optimized for performance
+# RL model parameters - Optimized for SPEED with 15 symbols
 STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)
 ACTION_DIM = len(STOCK_SYMBOLS)
-LEARNING_RATE = 0.0003  # Slightly higher for faster convergence
+LEARNING_RATE = 0.001  # Increased for faster convergence
 GAMMA = 0.99  # Higher discount factor for better long-term planning
-BATCH_SIZE = 8192  # Larger batch size for better GPU utilization
-MEMORY_SIZE = 200000  # Larger memory for more diverse experiences
-NOISE_SIGMA = 0.1  # Reduced noise for more stable training
-NOISE_THETA = 0.15  # Reduced theta for faster noise decay
+BATCH_SIZE = 2048  # Increased batch size for better GPU utilization
+MEMORY_SIZE = 75000  # Increased memory for better experience diversity with more symbols
+NOISE_SIGMA = 0.3  # Higher noise for better exploration
+NOISE_THETA = 0.2  # Faster noise decay
 
 # Load hyperparameters if available
 hyperparams_path = Path("./hyperparameters.json")

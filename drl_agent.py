@@ -59,8 +59,9 @@ class DRLAgent:
         tf.keras.backend.set_floatx("float32")
 
         # Create separate optimizers for actor and critic
-        self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-        self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        # Add gradient clipping for stability
+        self.actor_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
+        self.critic_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate, clipnorm=1.0)
 
         # Build models
         self.actor = self._build_actor()
@@ -95,73 +96,29 @@ class DRLAgent:
         )
 
     def _build_actor(self):
-        """Build policy network (actor) that selects actions with GPU optimizations."""
+        """Build policy network (actor)."""
         state_input = Input(shape=(self.state_dim,))
-        x = Dense(
-            512,
-            activation="relu",
-            kernel_initializer=tf.keras.initializers.HeNormal(),
-        )(state_input)
-        x = BatchNormalization(dtype="float32")(x)
-        x = Dense(
-            256,
-            activation="relu",
-            kernel_initializer=tf.keras.initializers.HeNormal(),
-        )(x)
-        x = BatchNormalization(dtype="float32")(x)
-        x = Dense(
-            128,
-            activation="relu",
-            kernel_initializer=tf.keras.initializers.HeNormal(),
-        )(x)
-        output = Dense(
-            self.action_dim,
-            activation="tanh",
-            kernel_initializer=tf.keras.initializers.GlorotNormal(),
-        )(x)
-        model = Model(inputs=state_input, outputs=output)
-        model.compile(loss="mse", optimizer=self.actor_optimizer)
-        return model
+        x = Dense(256, activation='relu')(state_input)
+        x = Dense(128, activation='relu')(x)
+        x = Dense(64, activation='relu')(x)
+        action_output = Dense(self.action_dim, activation='tanh')(x)
+        return Model(inputs=state_input, outputs=action_output)
 
     def _build_critic(self):
-        """Build value network (critic) that estimates Q-values with GPU optimizations."""
+        """Build value network (critic)."""
         state_input = Input(shape=(self.state_dim,))
         action_input = Input(shape=(self.action_dim,))
-
-        # State branch with batch normalization
-        state_h1 = Dense(
-            512, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(state_input)
-        state_bn1 = BatchNormalization(dtype="float32")(state_h1)
-        state_h2 = Dense(
-            256, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(state_bn1)
-        state_bn2 = BatchNormalization(dtype="float32")(state_h2)
-
-        # Action branch
-        action_h1 = Dense(
-            256, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(action_input)
-        action_bn1 = BatchNormalization(dtype="float32")(action_h1)
-
-        # Merge
-        merged = concatenate([state_bn2, action_bn1])
-        merged_h1 = Dense(
-            256, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(merged)
-        merged_bn1 = BatchNormalization(dtype="float32")(merged_h1)
-        merged_h2 = Dense(
-            128, activation="relu", kernel_initializer=tf.keras.initializers.HeNormal()
-        )(merged_bn1)
-        output = Dense(
-            1,
-            activation="linear",
-            kernel_initializer=tf.keras.initializers.GlorotNormal(),
-        )(merged_h2)
-
-        model = Model(inputs=[state_input, action_input], outputs=output)
-        model.compile(loss="mse", optimizer=self.critic_optimizer)
-        return model
+        
+        state_x = Dense(256, activation='relu')(state_input)
+        state_x = Dense(128, activation='relu')(state_x)
+        action_x = Dense(128, activation='relu')(action_input)
+        
+        combined = concatenate([state_x, action_x])
+        x = Dense(128, activation='relu')(combined)
+        x = Dense(64, activation='relu')(x)
+        q_value = Dense(1, activation=None)(x)
+        
+        return Model(inputs=[state_input, action_input], outputs=q_value)
 
     @tf.function
     def _actor_train_step(self, states):
@@ -225,58 +182,79 @@ class DRLAgent:
         return critic_loss
 
     @tf.function
-    def _parallel_train_step(self, states, actions, q_targets):
+    def _parallel_train_step(self, states, actions, rewards, next_states, dones):
         """
-        Performs parallel training of both actor and critic networks in a single function.
-        This reduces function call overhead and improves GPU utilization.
+        Performs parallel training of actor and critic networks with GPU acceleration.
         
         Args:
-            states: Batch of states with shape (batch_size, state_dim)
-            actions: Batch of actions with shape (batch_size, action_dim)
-            q_targets: Target Q-values with shape (batch_size, 1)
+            states: Batch of states
+            actions: Batch of actions
+            rewards: Batch of rewards
+            next_states: Batch of next states
+            dones: Batch of done flags
             
         Returns:
-            Tuple of (actor_loss, critic_loss)
+            Dictionary containing training losses
         """
-        # Actor training
-        with tf.GradientTape() as actor_tape:
-            actor_actions = self.actor(states, training=True)
-            actor_q_values = self.critic([states, actor_actions], training=True)
-            actor_loss = -tf.reduce_mean(actor_q_values)
-            actor_l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in self.actor.trainable_variables])
-            actor_loss += 1e-4 * actor_l2_loss
+        # Ensure all inputs are float32 for mixed precision compatibility
+        states = tf.cast(states, tf.float32)
+        actions = tf.cast(actions, tf.float32)
+        rewards = tf.cast(rewards, tf.float32)
+        next_states = tf.cast(next_states, tf.float32)
+        dones = tf.cast(dones, tf.float32)
         
-        # Critic training
-        with tf.GradientTape() as critic_tape:
-            critic_q_values = self.critic([states, actions], training=True)
-            critic_loss = tf.reduce_mean(tf.square(q_targets - critic_q_values))
-            critic_l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in self.critic.trainable_variables])
-            critic_loss += 1e-4 * critic_l2_loss
+        with tf.GradientTape(persistent=True) as tape:
+            # Actor forward pass
+            actions_pred = self.actor(states)
+            
+            # Critic forward pass for current state-action pairs
+            q_values = self.critic([states, actions])
+            
+            # Critic forward pass for next state-action pairs
+            next_actions = self.target_actor(next_states)
+            q_next = self.target_critic([next_states, next_actions])
+            
+            # Calculate target Q-values
+            q_targets = rewards + (1 - dones) * self.gamma * q_next[:, 0]
+            
+            # Calculate losses
+            critic_loss = tf.reduce_mean(tf.square(q_values[:, 0] - q_targets))
+            
+            # Actor loss (maximize Q-values)
+            actor_loss = -tf.reduce_mean(self.critic([states, actions_pred]))
+        
+        # Calculate gradients
+        actor_gradients = tape.gradient(actor_loss, self.actor.trainable_variables)
+        critic_gradients = tape.gradient(critic_loss, self.critic.trainable_variables)
         
         # Apply gradients
-        actor_gradients = actor_tape.gradient(actor_loss, self.actor.trainable_variables)
-        critic_gradients = critic_tape.gradient(critic_loss, self.critic.trainable_variables)
-        
         self.actor_optimizer.apply_gradients(zip(actor_gradients, self.actor.trainable_variables))
         self.critic_optimizer.apply_gradients(zip(critic_gradients, self.critic.trainable_variables))
         
-        return actor_loss, critic_loss
+        # Update target networks
+        self._update_target_networks()
+        
+        return {
+            "actor_loss": actor_loss,
+            "critic_loss": critic_loss
+        }
 
     def act(self, state, explore=True):
         """
-        Chooses an action based on the current state.
+        Selects an action using the actor network with exploration.
 
         Args:
             state: The current state of the environment.
-            explore: A boolean indicating whether to add exploration noise.
+            explore: Whether to add exploration noise.
 
         Returns:
-            An array representing the chosen action.
+            An action array with float32 dtype.
         """
-        if explore and np.random.rand() <= self.epsilon:
-            # Exploration: random actions, including a "sell all" action
-            action = np.random.uniform(-1, 1, self.action_dim)
-            if np.random.rand() < 0.1: # 10% chance to sell all
+        # Exploration: random actions
+        if np.random.random() < self.epsilon:
+            action = np.random.uniform(-1, 1, self.action_dim).astype(np.float32)
+            # Occasionally add a strong signal to encourage exploration
+            if np.random.random() < 0.1:
                 action[np.random.randint(0, self.action_dim)] = 0.6
             return action
 
@@ -288,66 +266,44 @@ class DRLAgent:
         if explore:
             action_output += self.noise()
 
-        return action_output
+        # Ensure float32 dtype
+        return np.array(action_output, dtype=np.float32)
 
     def remember(self, state, action, reward, next_state, done):
         """Stores an experience in the replay memory."""
         self.memory.push(state, action, reward, next_state, done)
 
-    def train(self, dataset):
+    def train(self, dataset_iterator):
         """
-        Trains the agent using a batch from the dataset with optimized performance.
+        Trains the agent using experiences from the replay buffer with GPU acceleration.
 
         Args:
-            dataset: A tf.data.Dataset iterator providing batches of experiences.
+            dataset_iterator: Iterator for the training dataset.
 
         Returns:
-            A dictionary containing the critic and actor losses.
+            Dictionary containing training losses.
         """
-        if dataset is None:
-            return
-
         try:
-            # Get the next batch from the dataset iterator
-            states, actions, rewards, next_states, dones = next(dataset)
+            # Get a batch of experiences
+            batch = next(dataset_iterator)
+            states, actions, rewards, next_states, dones = batch
 
-            # Ensure tensors have the correct data type and shape
+            # Ensure all tensors are float32 for consistent operations
             states = tf.cast(states, tf.float32)
             actions = tf.cast(actions, tf.float32)
             rewards = tf.cast(rewards, tf.float32)
             next_states = tf.cast(next_states, tf.float32)
             dones = tf.cast(dones, tf.float32)
 
-            # Calculate target Q-values using target networks
-            next_actions = self.target_actor(next_states, training=False)
-            q_next = self.target_critic([next_states, next_actions], training=False)
-            q_targets = rewards + (1 - dones) * self.gamma * q_next[:, 0]
-            q_targets = tf.expand_dims(q_targets, axis=1)
-
-            # Use parallel training for better performance
-            actor_loss, critic_loss = self._parallel_train_step(states, actions, q_targets)
-
-            # Decay epsilon
+            # Train actor and critic networks in parallel
+            losses = self._parallel_train_step(states, actions, rewards, next_states, dones)
+            # Epsilon decay after each batch to anneal exploration quickly
             if self.epsilon > self.epsilon_min:
-                self.epsilon *= self.epsilon_decay
+                self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+            return losses
 
-            # Soft update target networks
-            self._update_target_networks()
-
-            # Convert to numpy for logging
-            actor_loss_val = float(actor_loss.numpy())
-            critic_loss_val = float(critic_loss.numpy())
-
-            if np.isnan(actor_loss_val) or np.isnan(critic_loss_val):
-                logger.warning(f"NaN loss detected: actor_loss={actor_loss_val}, critic_loss={critic_loss_val}")
-
-            return {"critic_loss": critic_loss_val, "actor_loss": actor_loss_val}
-
-        except StopIteration:
-            # Dataset iterator exhausted
-            return None
         except Exception as e:
-            logger.error(f"Error during training: {e}")
+            print(f"Training error: {e}")
             return None
 
     def _update_target_networks(self, tau=0.005):

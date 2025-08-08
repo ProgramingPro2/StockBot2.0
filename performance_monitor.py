@@ -1,10 +1,12 @@
-import time
 import psutil
 import GPUtil
+import time
 import threading
-from collections import deque
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
+from collections import deque
 
 class PerformanceMonitor:
     """Monitors system performance during training."""

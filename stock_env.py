@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 import requests
 import json
+import tensorflow as tf
 # Removed these as we are now using direct requests for historical bars
 # from alpaca.data.historical import StockHistoricalDataClient
 # from alpaca.data.requests import StockBarsRequest
@@ -12,6 +13,8 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 import yfinance as yf
+import os
+import time
 
 # Ensure config.py is correctly set up with your keys
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, USE_YFINANCE
@@ -62,6 +65,17 @@ class StockTradingEnvironment:
             (len(self.symbols) * 2) + 1 + (len(self.symbols) * self.lookback_window)
         )
         self.shares = {symbol: 0 for symbol in self.symbols}
+        
+        # Initialize current_prices
+        self.current_prices = {symbol: 100.0 for symbol in self.symbols}
+        
+        # GPU acceleration: Pre-allocate tensors on GPU
+        self.device = '/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'
+        with tf.device(self.device):
+            self.shares_tensor = tf.zeros(len(self.symbols), dtype=tf.float32)
+            self.balance_tensor = tf.constant(initial_balance, dtype=tf.float32)
+            self.price_history_tensor = None  # Will be initialized in reset()
+        
         self.reset()
 
     def reset(self):
@@ -76,330 +90,471 @@ class StockTradingEnvironment:
         if not np.isfinite(self.balance) or self.balance <= 0:
             logger.warning(f"Invalid initial balance detected: ${float(self.balance):.2f}, resetting to ${self.initial_balance:.2f}")
             self.balance = self.initial_balance
+        
+        # Use cached data if available to prevent repeated downloads
+        if not StockTradingEnvironment._global_data_cache:
+            self.data, failed_symbols = self._get_data()
+            # Cache the data globally
+            StockTradingEnvironment._global_data_cache = self.data.copy()
+        else:
+            self.data = StockTradingEnvironment._global_data_cache.copy()
+            failed_symbols = []
             
-        self.data, failed_symbols = self._get_data() # This calls the modified data fetching method
         self.symbols = [s for s in self.symbols if s not in failed_symbols]
+        
+        logger.info(f"Loaded data for {len(self.symbols)} symbols. Failed symbols: {failed_symbols}")
+        
+        # Debug: Check data structure for first symbol
+        if self.symbols and self.symbols[0] in self.data:
+            first_symbol = self.symbols[0]
+            first_data = self.data[first_symbol]
+            logger.info(f"Data structure for {first_symbol}: shape={first_data.shape}, columns={list(first_data.columns)}")
+        
+        # Prefetch data for faster access
         self.prefetched_data = self.prefetch_data()
-
-        # Ensure we have enough data for lookback window - use numpy for efficiency
-        data_lengths = np.array(
-            [len(self.prefetched_data[symbol]) for symbol in self.symbols if symbol in self.prefetched_data]
-        )
-        min_data_length = np.min(data_lengths) if data_lengths.size > 0 else 0
-
-        # Set current step to lookback_window or to data length if not enough data
-        # IMPORTANT: Since data is now fetched in ASCENDING order (oldest first),
-        # self.current_step will represent the index from the OLDEST data point.
-        # The environment will effectively run forwards from the oldest data.
-        self.current_step = self.lookback_window # Start after the initial lookback window
-
-        if min_data_length < self.lookback_window + 1: # Need at least lookback_window + 1 data points to start
-            logger.warning(
-                f"Not enough data for full lookback window. Min data length: {min_data_length} vs required: {self.lookback_window + 1}."
-            )
-            # If not enough data, start at the earliest possible step
-            self.current_step = min_data_length - 1 if min_data_length > 0 else 0
-            if self.current_step < 0:
-                self.current_step = 0 # Ensure it's not negative
-            logger.warning(f"Adjusted starting step to {self.current_step} due to insufficient data.")
-
-        self.shares = {symbol: 0 for symbol in self.symbols}
-        self.done = False
-        # Pre-allocate memory for history
-        self.portfolio_value_history = [float(self.initial_balance)]
-
-        # Pre-cache current prices for all symbols
+        
+        # Initialize step counter
+        self.current_step = self.lookback_window
+        
+        # Initialize current prices
         self._update_current_prices()
-
+        
+        # Initialize portfolio tracking
+        self.portfolio_value_history = [self.initial_balance]
+        self.done = False
+        
+        logger.info(f"Environment reset complete. Current step: {self.current_step}, Data length: {len(self.data[self.symbols[0]])}")
+        
         return self._get_state()
 
-
-    def _update_current_prices(self):
-        """Caches the current prices for all symbols to avoid repeated lookups."""
-        raw_prices = [
-            self.prefetched_data[symbol][self.current_step]
-            for symbol in self.symbols if symbol in self.prefetched_data
-        ]
-        
-        # Validate and sanitize prices
-        validated_prices = []
-        for i, price in enumerate(raw_prices):
-            symbol = self.symbols[i] if i < len(self.symbols) else f"UNKNOWN_{i}"
-            
-            # Check for invalid prices
-            if not np.isfinite(price) or price <= 0 or price > 10000:
-                logger.warning(f"Invalid price detected for {symbol}: ${float(price):.2f}, using default price $100")
-                validated_prices.append(100.0)  # Use reasonable default price
-            else:
-                validated_prices.append(float(price))
-        
-        self.current_prices = np.array(validated_prices, dtype=np.float32)
-
-    def _get_state(self):
-        """Creates the state representation with vectorized operations for better performance.
-
-        Returns:
-            A numpy array representing the current state of the environment.
+    def _calculate_portfolio_value_gpu(self, current_prices):
         """
-        # Reuse pre-allocated array for better performance
-        state = np.zeros(self.state_size, dtype=np.float32)
-
-        # Current price and holdings with vectorized operations
-        prices = self.current_prices / self.price_normalization
-        shares = (
-            np.array([self.shares[s] for s in self.symbols if s in self.prefetched_data], dtype=np.float32)
-            / self.shares_normalization
-        )
-        if len(prices) != len(shares):
-            return state
-        state[: len(self.symbols) * 2] = np.column_stack((prices, shares)).flatten()
-
-        # Add normalized balance
-        state[len(self.symbols) * 2] = self.balance / self.initial_balance
-
-        # Add historical price data in a vectorized way
-        lookback_start_idx = (len(self.symbols) * 2) + 1
-        for i, symbol in enumerate(self.symbols):
-            if symbol not in self.prefetched_data:
-                continue
-            start_idx = lookback_start_idx + (i * self.lookback_window)
-            end_idx = start_idx + self.lookback_window
-
-            # Adjusting for ascending data:
-            # We need prices from current_step - lookback_window to current_step
-            # Since data is oldest (index 0) to newest
-            current_data_for_symbol = self.prefetched_data[symbol]
+        GPU-accelerated portfolio value calculation.
+        
+        Args:
+            current_prices: Tensor of current prices for all symbols
             
-            # Calculate the actual start and end indices for the lookback slice
-            # The slice should be [current_step - lookback_window : current_step]
-            # Ensure we don't go out of bounds at the beginning of the data
-            actual_lookback_start_index = max(0, self.current_step - self.lookback_window)
-            actual_lookback_end_index = self.current_step
+        Returns:
+            Portfolio value as a tensor
+        """
+        with tf.device(self.device):
+            # Calculate stock values
+            stock_values = self.shares_tensor * current_prices
             
-            # Slice the relevant historical prices
-            prices_slice = current_data_for_symbol[actual_lookback_start_index : actual_lookback_end_index]
+            # Total portfolio value = cash + stock values
+            portfolio_value = self.balance_tensor + tf.reduce_sum(stock_values)
             
-            # If the slice is shorter than the lookback_window, pad it with the oldest available price
-            # or a sensible default to maintain state size.
-            if len(prices_slice) < self.lookback_window:
-                # Pad with the oldest available price or a default if no prices at all
-                padding_value = prices_slice[0] if prices_slice.size > 0 else 100.0
-                prices = np.full(self.lookback_window, padding_value, dtype=np.float32)
-                # Place the actual data at the end of the padded array
-                prices[self.lookback_window - len(prices_slice):] = prices_slice.flatten() # Added .flatten()
-            else:
-                prices = prices_slice.flatten() # Added .flatten()
+            return portfolio_value
 
-
-            # Normalize the historical prices
-            price_max = np.max(prices) if prices.size > 0 else 1.0
-            state[start_idx:end_idx] = prices / max(price_max, 1e-8)
-
+    def _get_state_gpu(self, current_prices, price_history):
+        """
+        GPU-accelerated state calculation.
+        
+        Args:
+            current_prices: Tensor of current prices for all symbols
+            price_history: Tensor of price history for all symbols
+            
+        Returns:
+            State tensor
+        """
+        with tf.device(self.device):
+            # Normalize prices and shares
+            normalized_prices = current_prices / self.price_normalization
+            normalized_shares = self.shares_tensor / self.shares_normalization
+            normalized_balance = self.balance_tensor / self.price_normalization
+            
+            # Create state components
+            price_component = tf.reshape(normalized_prices, [-1])
+            shares_component = tf.reshape(normalized_shares, [-1])
+            balance_component = tf.expand_dims(normalized_balance, 0)
+        
+        # Flatten price history
+        history_component = tf.reshape(price_history, [-1])
+        
+        # Concatenate all components
+        state = tf.concat([price_component, shares_component, balance_component, history_component], axis=0)
+        
         return state
 
+    def _update_current_prices(self):
+        """Updates the current prices for all stocks."""
+        try:
+            for symbol in self.symbols:
+                if symbol in self.data and self.current_step < len(self.data[symbol]):
+                    # Get the data for this symbol
+                    data = self.data[symbol]
+                    
+                    # Handle multi-level columns from yfinance
+                    close_price = None
+                    
+                    # Try to find the close price column
+                    if hasattr(data.columns, 'levels') and len(data.columns.levels) > 1:
+                        # Multi-level columns - look for Close in the first level
+                        for col in data.columns:
+                            if isinstance(col, tuple) and 'Close' in col[0]:
+                                close_price = data.iloc[self.current_step][col]
+                                break
+                        # If not found, try flattened columns
+                        if close_price is None:
+                            # Flatten multi-level columns
+                            data.columns = [col[1] if isinstance(col, tuple) and len(col) > 1 else col for col in data.columns]
+                            if 'Close' in data.columns:
+                                close_price = data.iloc[self.current_step]['Close']
+                    else:
+                        # Single-level columns
+                        if 'Close' in data.columns:
+                            close_price = data.iloc[self.current_step]['Close']
+                        else:
+                            # Try alternative column names
+                            for col_name in ["close", "c", "C"]:
+                                if col_name in data.columns:
+                                    close_price = data.iloc[self.current_step][col_name]
+                                    break
+                    
+                    # Ensure we get a single float value
+                    if close_price is not None:
+                        if isinstance(close_price, (list, tuple, np.ndarray)):
+                            # Take the first value if it's a sequence
+                            close_price = float(close_price[0]) if len(close_price) > 0 else 100.0
+                        else:
+                            close_price = float(close_price)
+                        
+                        # Handle NaN or infinite values
+                        if np.isnan(close_price) or np.isinf(close_price):
+                            close_price = 100.0
+                        
+                        self.current_prices[symbol] = close_price
+                    else:
+                        # Fallback to first column value
+                        try:
+                            first_col = data.columns[0]
+                            fallback_price = data.iloc[self.current_step][first_col]
+                            if isinstance(fallback_price, (list, tuple, np.ndarray)):
+                                fallback_price = float(fallback_price[0]) if len(fallback_price) > 0 else 100.0
+                            else:
+                                fallback_price = float(fallback_price)
+                            
+                            if np.isnan(fallback_price) or np.isinf(fallback_price):
+                                fallback_price = 100.0
+                            
+                            self.current_prices[symbol] = fallback_price
+                        except:
+                            self.current_prices[symbol] = 100.0
+                else:
+                    logger.warning(f"No data available for {symbol} at step {self.current_step}")
+                    # Set a default price if data is missing
+                    self.current_prices[symbol] = 100.0
+        except Exception as e:
+            logger.error(f"Error updating current prices: {e}")
+            # Set default prices for all symbols if there's an error
+            for symbol in self.symbols:
+                self.current_prices[symbol] = 100.0
 
-    def _calculate_portfolio_value(self):
-        """Calculates the current portfolio value.
-
-        Returns:
-            The current total value of the portfolio (cash + assets).
+    def _get_state(self):
         """
-        # Use the cached current prices for faster calculation
-        portfolio_value = self.balance
-
-        # Vectorized calculation using numpy for efficiency
-        shares = np.array([self.shares[s] for s in self.symbols if s in self.prefetched_data], dtype=np.float32)
-        assets_value = np.sum(shares * self.current_prices)
-        portfolio_value += assets_value
-
-        # Sanity check - ensure portfolio value is reasonable
-        if not np.isfinite(portfolio_value) or portfolio_value < 0:
-            logger.warning(f"Invalid portfolio value calculated: {float(portfolio_value)}, balance: {float(self.balance)}, assets: {float(assets_value)}")
-            portfolio_value = max(0.0, float(self.balance))  # At minimum, portfolio should be cash balance
+        Returns the current state of the environment optimized for GPU processing.
         
-        # Debug: Log if portfolio value is extremely high
-        if portfolio_value > self.initial_balance * 100:  # More than 100x initial balance
-            logger.warning(f"High portfolio value calculated: ${float(portfolio_value):.2f}")
-            logger.warning(f"Balance: ${float(self.balance):.2f}, Assets: ${float(assets_value):.2f}")
-            logger.warning(f"Shares: {dict(self.shares)}")
-            logger.warning(f"Current prices: {self.current_prices}")
-            logger.warning(f"Symbols: {self.symbols}")
+        Returns:
+            A numpy array representing the current state.
+        """
+        # Ensure current prices are updated
+        self._update_current_prices()
+        
+        # Convert current prices to tensor, ensuring all values are floats
+        current_prices_list = []
+        for symbol in self.symbols:
+            price = self.current_prices[symbol]
+            # Ensure price is a single float value
+            if isinstance(price, (list, tuple, np.ndarray)):
+                price = float(price[0]) if len(price) > 0 else 100.0
+            else:
+                price = float(price)
+            
+            # Handle NaN or infinite values
+            if np.isnan(price) or np.isinf(price):
+                price = 100.0
+            
+            current_prices_list.append(price)
+        
+        current_prices_array = np.array(current_prices_list, dtype=np.float32)
+        
+        # Get price history for lookback window
+        price_history = []
+        for symbol in self.symbols:
+            symbol_data = self.prefetched_data[symbol]  # This is now a numpy array
+            start_idx = max(0, self.current_step - self.lookback_window + 1)
+            end_idx = self.current_step + 1
+            # Use numpy array indexing instead of pandas iloc
+            symbol_history = symbol_data[start_idx:end_idx]
+            # Pad with the last known price if not enough history
+            if len(symbol_history) < self.lookback_window:
+                if len(symbol_history) > 0:
+                    padding = [symbol_history[-1]] * (self.lookback_window - len(symbol_history))
+                    symbol_history = np.concatenate([padding, symbol_history])
+                else:
+                    # If no data available, use a default price
+                    symbol_history = np.full(self.lookback_window, 100.0, dtype=np.float32)
+            price_history.append(symbol_history)
+        
+        price_history_array = np.array(price_history, dtype=np.float32)
+        
+        # Use GPU acceleration if available
+        if self.device == '/GPU:0':
+            with tf.device(self.device):
+                current_prices_tensor = tf.convert_to_tensor(current_prices_array, dtype=tf.float32)
+                price_history_tensor = tf.convert_to_tensor(price_history_array, dtype=tf.float32)
+                
+                # Update tensors
+                self.shares_tensor = tf.convert_to_tensor([self.shares[symbol] for symbol in self.symbols], dtype=tf.float32)
+                
+                # Calculate state on GPU
+                state_tensor = self._get_state_gpu(current_prices_tensor, price_history_tensor)
+                return state_tensor.numpy()
+        else:
+            # Fallback to CPU calculation
+            return self._get_state_cpu(current_prices_array, price_history_array)
 
-        return float(portfolio_value)
+    def _get_state_cpu(self, current_prices, price_history):
+        """
+        CPU fallback for state calculation.
+        
+        Args:
+            current_prices: Array of current prices
+            price_history: Array of price history
+            
+        Returns:
+            State array
+        """
+        state = []
+        
+        # Add current prices
+        for price in current_prices:
+            state.append(price / self.price_normalization)
+        
+        # Add current shares
+        for symbol in self.symbols:
+            state.append(self.shares[symbol] / self.shares_normalization)
+        
+        # Add current balance
+        state.append(self.balance / self.price_normalization)
+        
+        # Add price history
+        for symbol_history in price_history:
+            for price in symbol_history:
+                state.append(price / self.price_normalization)
+        
+        return np.array(state, dtype=np.float32)
+
 
     def step(self, action):
         """
-        Executes a trading action in the environment.
+        Executes one step in the environment.
 
         Args:
-            action: An array of continuous actions for each stock symbol.
+            action: A numpy array of actions for each stock.
 
         Returns:
-            A tuple containing:
-                - next_state: The new state of the environment after the action.
-                - reward: The reward received for the action.
-                - done: A boolean indicating if the episode is finished.
-                - info: A dictionary containing additional information (e.g., portfolio value).
+            tuple: (next_state, reward, done, info)
         """
-        # Map continuous actions to discrete buy/sell decisions
-        transaction_reward = 0
-        # profit_reward = 0  # Removed since we're not using it anymore
-        for i, symbol in enumerate(self.symbols):
-            if symbol not in self.prefetched_data:
-                continue
-            signal = action[i]
-            current_price = self.current_prices[i]
+        # Ensure action is the right type and shape
+        action = np.array(action, dtype=np.float32)
+        if len(action) != len(self.symbols):
+            raise ValueError(f"Action length {len(action)} doesn't match number of symbols {len(self.symbols)}")
 
-            # Validate current price to prevent arithmetic errors
-            if not np.isfinite(current_price) or current_price <= 0 or current_price > 10000:
-                logger.warning(f"Invalid price detected for {symbol}: ${float(current_price):.2f}, skipping trades")
-                continue
+        # Initialize current_prices if not already done
+        if not hasattr(self, 'current_prices') or not self.current_prices:
+            self.current_prices = {}
+            for symbol in self.symbols:
+                self.current_prices[symbol] = 100.0  # Default price
 
-            if signal > 0:  # Buy signal
-                # Add minimum threshold to prevent $0.00 costs from tiny signals
-                if signal < 0.1:  # Ignore signals smaller than 10% of max trade
-                    continue
-                    
-                shares_to_buy = int(signal * self.max_shares_per_trade)
-                cost = shares_to_buy * current_price
-                
-                # Additional safety check on cost calculation
-                if not np.isfinite(cost) or cost < 0:  # Changed from cost <= 0 to cost < 0
-                    logger.warning(f"Invalid cost calculated for {symbol}: ${float(cost):.2f}, skipping buy")
-                    continue
-                    
-                if cost <= self.balance and shares_to_buy > 0:
-                    self.balance -= cost
-                    self.shares[symbol] += shares_to_buy
-                    transaction_reward += 0.001  # Small positive reward for successful trades
-                    
-                    # Debug: Log large purchases
-                    if shares_to_buy > 10:  # More than 10 shares
-                        logger.warning(f"Large purchase: {shares_to_buy} shares of {symbol} at ${float(current_price):.2f} = ${float(cost):.2f}")
-            elif signal < 0:  # Sell signal
-                # Add minimum threshold to prevent tiny sell signals
-                if signal > -0.1:  # Ignore signals smaller than 10% of max trade
-                    continue
-                    
-                shares_to_sell = int(
-                    -signal * min(self.max_shares_per_trade, self.shares[symbol])
-                )
-                if shares_to_sell > 0:
-                    sale_proceeds = shares_to_sell * current_price
-                    
-                    # Additional safety check on sale proceeds calculation
-                    if not np.isfinite(sale_proceeds) or sale_proceeds < 0:  # Changed from sale_proceeds <= 0 to sale_proceeds < 0
-                        logger.warning(f"Invalid sale proceeds calculated for {symbol}: ${float(sale_proceeds):.2f}, skipping sell")
-                        continue
-                    
-                    self.balance += sale_proceeds
-                    self.shares[symbol] -= shares_to_sell
-                    transaction_reward += 0.001  # Small positive reward for successful trades
-                    # Remove double counting - profit is already captured in portfolio value change
-                    # profit_reward += (shares_to_sell * current_price) - (shares_to_sell * self.current_prices[i])
+        # Update current prices
+        self._update_current_prices()
 
-        # Periodic balance validation check (every 1000 steps to reduce log noise)
-        if self.current_step % 1000 == 0:
-            if not np.isfinite(self.balance) or self.balance < 0:
-                logger.warning(f"Balance corruption detected at step {self.current_step}: ${float(self.balance):.2f}, resetting to reasonable value")
-                # Reset to a reasonable balance based on current portfolio
-                assets_value = sum(self.shares[s] * self.current_prices[i] for i, s in enumerate(self.symbols) if s in self.shares)
-                self.balance = max(self.initial_balance * 0.1, assets_value * 0.1)  # At least 10% of initial or 10% of assets
-                logger.warning(f"Reset balance to ${float(self.balance):.2f}")
+        # Execute trades
+        if self.device == '/GPU:0':
+            try:
+                current_prices_array = np.array([self.current_prices[symbol] for symbol in self.symbols], dtype=np.float32)
+                balance_tensor, shares_tensor = self._execute_trades_gpu(action, current_prices_array)
+                self.balance = float(balance_tensor.numpy())
+                self.shares = {symbol: float(shares_tensor[i].numpy()) for i, symbol in enumerate(self.symbols)}
+                self.balance_tensor = balance_tensor
+                self.shares_tensor = shares_tensor
+            except Exception as e:
+                logger.warning(f"GPU trading failed, falling back to CPU: {e}")
+                self._execute_trades_cpu(action)
+        else:
+            self._execute_trades_cpu(action)
 
-        # Calculate reward as the change in portfolio value
-        old_portfolio_value = self.portfolio_value_history[-1]
-        new_portfolio_value = self._calculate_portfolio_value()
-
-        # Validate portfolio value is reasonable (not infinite or NaN)
-        if not np.isfinite(new_portfolio_value) or new_portfolio_value < 0:
-            logger.warning(f"Invalid portfolio value detected: {float(new_portfolio_value)}, using previous value")
-            new_portfolio_value = old_portfolio_value
-        
-        # Debug: Log extremely high portfolio values
-        if new_portfolio_value > self.initial_balance * 1000:  # More than 1000x initial balance
-            logger.warning(f"Extremely high portfolio value detected: ${float(new_portfolio_value):.2f} (initial: ${self.initial_balance:.2f})")
-            logger.warning(f"Balance: ${float(self.balance):.2f}, Shares: {self.shares}")
-            logger.warning(f"Current prices: {self.current_prices}")
-            
-            # Cap the portfolio value to prevent runaway growth
-            new_portfolio_value = self.initial_balance * 100  # Cap at 100x initial balance
-            logger.warning(f"Capped portfolio value to ${float(new_portfolio_value):.2f}")
-
-        # CRITICAL FIX: Also cap the balance itself to prevent astronomical growth
-        # The balance should never exceed a reasonable multiple of the initial balance
-        max_reasonable_balance = self.initial_balance * 50  # Cap balance at 50x initial balance
-        if self.balance > max_reasonable_balance:
-            logger.warning(f"Balance too high: ${float(self.balance):.2f}, capping to ${float(max_reasonable_balance):.2f}")
-            self.balance = max_reasonable_balance
-            
-            # Recalculate portfolio value after balance adjustment
-            new_portfolio_value = self._calculate_portfolio_value()
-            logger.warning(f"Recalculated portfolio value after balance cap: ${float(new_portfolio_value):.2f}")
-
-        # Primary reward is the profit or loss
-        profit_loss_reward = new_portfolio_value - old_portfolio_value
-
-        # Combine reward components with proper scaling
-        reward = profit_loss_reward + transaction_reward
-        # Apply reward scaling factor
-        reward *= self.reward_scaling_factor
-
-        self.portfolio_value_history.append(float(new_portfolio_value))
-
-        # Move to next time step (i.e., move to the next newer bar)
+        # Move to next step
         self.current_step += 1
 
-        # Check if we've reached the end of our data (i.e., exhausted all available historical bars)
-        min_data_length = min(
-            len(self.prefetched_data[symbol]) for symbol in self.symbols if symbol in self.prefetched_data
-        )
-        if self.current_step >= min_data_length: # No -1 here, as current_step is the index of the *next* bar
-            self.done = True
+        # Check if episode is done
+        done = self.current_step >= len(self.data[self.symbols[0]]) - 1
 
-        # Update current prices for the new time step (which is now a newer bar)
-        if not self.done:
-            self._update_current_prices() # Only update if not done to avoid index out of bounds
+        # Calculate reward - only give reward at the end of episode
+        if done:
+            final_portfolio_value = self._calculate_portfolio_value()
+            # Calculate percentage return instead of absolute difference
+            if self.initial_balance > 0:
+                percentage_return = (final_portfolio_value - self.initial_balance) / self.initial_balance
+                reward = percentage_return * self.reward_scaling_factor
+            else:
+                reward = 0.0
+        else:
+            # Small intermediate reward based on current portfolio value
+            current_portfolio_value = self._calculate_portfolio_value()
+            if self.initial_balance > 0:
+                current_return = (current_portfolio_value - self.initial_balance) / self.initial_balance
+                reward = current_return * 0.01  # Small intermediate reward
+            else:
+                reward = 0.0
 
-        return (
-            self._get_state(),
-            float(reward),
-            self.done,
-            {"portfolio_value": new_portfolio_value},
-        )
+        # Get next state
+        next_state = self._get_state()
+
+        # Calculate current portfolio value for info
+        current_portfolio_value = self._calculate_portfolio_value()
+
+        # Prepare info
+        info = {
+            "portfolio_value": current_portfolio_value,
+            "balance": self.balance,
+            "shares": self.shares.copy(),
+            "current_step": self.current_step
+        }
+
+        return next_state, reward, done, info
+
+    def _execute_trades_gpu(self, action, current_prices):
+        """
+        GPU-accelerated trade execution.
+        
+        Args:
+            action: Action array
+            current_prices: Current prices tensor
+        """
+        with tf.device(self.device):
+            # Convert action to tensor with proper data type handling
+            if isinstance(action, tf.Tensor):
+                action_tensor = tf.cast(action, tf.float32)
+            else:
+                action_tensor = tf.convert_to_tensor(action, dtype=tf.float32)
+            
+            # Convert current_prices to tensor if needed
+            if not isinstance(current_prices, tf.Tensor):
+                current_prices = tf.convert_to_tensor(current_prices, dtype=tf.float32)
+            
+            # Calculate trade amounts
+            trade_amounts = action_tensor * self.max_shares_per_trade
+            
+            # Don't allow buying if balance is zero (tensor-safe)
+            balance_nonpos = tf.less_equal(self.balance_tensor, 0.0)
+            trade_amounts = tf.where(balance_nonpos, tf.minimum(trade_amounts, 0.0), trade_amounts)
+            
+            # Calculate trade costs
+            trade_costs = trade_amounts * current_prices
+            
+            # Check if we have enough balance for purchases
+            total_cost = tf.reduce_sum(tf.maximum(trade_costs, 0))  # Only positive costs (buys)
+            
+            # If we don't have enough balance, scale down purchases (tensor-safe)
+            need_scale = tf.greater(total_cost, self.balance_tensor)
+            safe_scale = tf.where(need_scale, self.balance_tensor / (total_cost + 1e-8), 1.0)
+            trade_amounts = tf.where(trade_amounts > 0, trade_amounts * safe_scale, trade_amounts)
+            trade_costs = trade_amounts * current_prices
+            
+            # Update and clamp balance
+            new_balance = tf.maximum(self.balance_tensor - tf.reduce_sum(trade_costs), 0.0)
+            
+            # Update and clamp shares (no shorting)
+            new_shares = tf.maximum(self.shares_tensor + trade_amounts, 0.0)
+            
+            # Return updated values
+            return new_balance, new_shares
+
+    def _execute_trades_cpu(self, action):
+        """
+        CPU fallback for trade execution.
+        
+        Args:
+            action: Action array
+        """
+        for i, symbol in enumerate(self.symbols):
+            if symbol not in self.current_prices:
+                continue
+                
+            current_price = self.current_prices[symbol]
+            trade_amount = action[i] * self.max_shares_per_trade
+            
+            # Don't allow buying if balance is zero
+            if self.balance <= 0 and trade_amount > 0:
+                trade_amount = 0  # Can't buy without money
+            
+            # Calculate trade cost
+            trade_cost = trade_amount * current_price
+            
+            # Check if we have enough balance for purchases
+            if trade_cost > 0 and trade_cost > self.balance:
+                # Scale down the purchase
+                scale_factor = self.balance / trade_cost
+                trade_amount *= scale_factor
+                trade_cost = trade_amount * current_price
+            
+            # Execute the trade
+            self.balance -= trade_cost
+            self.shares[symbol] += trade_amount
+            
+            # Prevent negative balance and shares
+            self.balance = max(self.balance, 0.0)
+            self.shares[symbol] = max(self.shares[symbol], 0.0)
+
+    def _calculate_portfolio_value(self):
+        """
+        Calculates the current portfolio value with GPU acceleration.
+        
+        Returns:
+            The current portfolio value.
+        """
+        if not self.current_prices:
+            return self.balance
+        
+        # Use GPU acceleration if available
+        if self.device == '/GPU:0':
+            with tf.device(self.device):
+                current_prices_array = np.array([self.current_prices[symbol] for symbol in self.symbols], dtype=np.float32)
+                current_prices_tensor = tf.convert_to_tensor(current_prices_array, dtype=tf.float32)
+                self.shares_tensor = tf.convert_to_tensor([self.shares[symbol] for symbol in self.symbols], dtype=tf.float32)
+                portfolio_value = self._calculate_portfolio_value_gpu(current_prices_tensor)
+                return float(portfolio_value.numpy())
+        else:
+            # CPU fallback
+            portfolio_value = self.balance
+            for symbol in self.symbols:
+                if symbol in self.current_prices:
+                    portfolio_value += self.shares[symbol] * self.current_prices[symbol]
+            return portfolio_value
 
     def _get_data(self):
         """
-        Fetches historical stock data with robust fallback mechanisms.
+        Fetches historical stock data with optimized caching and parallel processing.
         
         Returns:
             tuple: (data_dict, failed_symbols)
         """
-        # Try Alpaca first
-        try:
-            logger.info("Attempting to fetch data from Alpaca API...")
-            data, failed_symbols = self._get_alpaca_data()
-            if data and len(data) > 0:
-                logger.info(f"Successfully fetched data from Alpaca for {len(data)} symbols")
-                return data, failed_symbols
-        except Exception as e:
-            logger.warning(f"Alpaca data fetching failed: {e}")
+        logger.info("Fetching historical stock data...")
+        start_time = time.time()
         
-        # Fallback to yfinance
-        try:
-            logger.info("Falling back to yfinance for data...")
+        # Use yfinance for faster data fetching
+        if USE_YFINANCE:
             data, failed_symbols = self._get_yfinance_data()
-            if data and len(data) > 0:
-                logger.info(f"Successfully fetched data from yfinance for {len(data)} symbols")
-                return data, failed_symbols
-        except Exception as e:
-            logger.error(f"yfinance data fetching failed: {e}")
+        else:
+            data, failed_symbols = self._get_alpaca_data()
         
-        # If both sources fail, raise a comprehensive error
-        error_msg = "All data sources failed. Please check your internet connection and API credentials."
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
+        fetch_time = time.time() - start_time
+        logger.info(f"Data fetching completed in {fetch_time:.2f} seconds")
         
+        return data, failed_symbols
+    
     def _get_alpaca_data(self):
         """Fetches historical stock data from Alpaca Markets API with caching.
 
@@ -409,9 +564,9 @@ class StockTradingEnvironment:
         # BASE_URL for Alpaca Data API stock bars
         BARS_BASE_URL = "https://data.alpaca.markets/v2/stocks/bars"
 
-        if all(symbol in self._global_data_cache for symbol in self.symbols):
+        if all(symbol in StockTradingEnvironment._global_data_cache for symbol in self.symbols):
             logger.info("Using in-memory cached data for all symbols")
-            return {symbol: self._global_data_cache[symbol] for symbol in self.symbols}
+            return {symbol: StockTradingEnvironment._global_data_cache[symbol] for symbol in self.symbols}
 
         # Calculate start and end dates relative to current time for consistency
         # End date is now, start date is (1 year + 2 * lookback) days ago
@@ -437,7 +592,7 @@ class StockTradingEnvironment:
                 try:
                     stock_data = pd.read_pickle(cache_file)
                     data[symbol] = stock_data
-                    self._global_data_cache[symbol] = stock_data
+                    StockTradingEnvironment._global_data_cache[symbol] = stock_data
                     logger.info(f"Loaded cached data for {symbol} from {cache_file}")
                 except Exception as e:
                     logger.warning(
@@ -537,7 +692,7 @@ class StockTradingEnvironment:
         for symbol, stock_data in results:
             if stock_data is not None:
                 data[symbol] = stock_data
-                self._global_data_cache[symbol] = stock_data
+                StockTradingEnvironment._global_data_cache[symbol] = stock_data
             else:
                 logger.warning(f"Skipping {symbol} due to failed data download or empty response.")
                 failed_symbols.append(symbol)
@@ -546,6 +701,8 @@ class StockTradingEnvironment:
             raise ValueError("Could not fetch valid data for any of the specified symbols.")
 
         return data, failed_symbols
+    
+# Removed merge function - not used in current implementation
 
     def _get_yfinance_data(self):
         """Gets historical stock data for all symbols with caching using yfinance.
@@ -564,12 +721,12 @@ class StockTradingEnvironment:
                     stock_data = pd.read_pickle(cache_file)
                     if not stock_data.empty:
                         data[symbol] = stock_data
-                        self._global_data_cache[symbol] = stock_data
+                        StockTradingEnvironment._global_data_cache[symbol] = stock_data
                         logger.info(f"Loaded cached yfinance data for {symbol} from {cache_file}")
                     else:
                         raise ValueError("Cached data is empty.")
                 else:
-                    stock_data = yf.download(symbol, start=start_date, end=end_date, interval="1h")
+                    stock_data = yf.download(symbol, start=start_date, end=end_date, interval="1h", progress=False, auto_adjust=True)
                     if not stock_data.empty:
                         data[symbol] = stock_data
                         stock_data.to_pickle(cache_file)
@@ -589,25 +746,68 @@ class StockTradingEnvironment:
         prefetched_data = {}
         for symbol in self.data.keys():
             try:
-                # Only prefetch what we need (close prices)
-                # Store as numpy array for CPU optimization
-                # Ensure the 'Close' column exists
-                if symbol in self.data and "Close" in self.data[symbol].columns:
-                    close_prices = np.asarray(
-                        self.data[symbol]["Close"].values, dtype=np.float32
-                    )
-                    prefetched_data[symbol] = close_prices
+                # Check for different possible column names
+                symbol_data = self.data[symbol]
+                close_column = None
+                
+                # Handle multi-level column names (like yfinance data)
+                if hasattr(symbol_data.columns, 'levels') and len(symbol_data.columns.levels) > 1:
+                    # Multi-level columns - look for Close in the first level
+                    for col in symbol_data.columns:
+                        if isinstance(col, tuple) and 'Close' in col[0]:
+                            close_column = col
+                            break
+                    # If not found, try to flatten the columns
+                    if close_column is None:
+                        # Flatten multi-level columns
+                        symbol_data.columns = [col[1] if isinstance(col, tuple) and len(col) > 1 else col for col in symbol_data.columns]
+                        # Now try to find Close column
+                        for col_name in ["Close", "close", "c", "C"]:
+                            if col_name in symbol_data.columns:
+                                close_column = col_name
+                                break
                 else:
-                    logger.warning(f"No 'Close' data found for {symbol} after fetching.")
-                    # Provide dummy data or raise an error, depending on desired behavior
+                    # Single-level columns - try different possible column names
+                    for col_name in ["Close", "close", "c", "C"]:
+                        if col_name in symbol_data.columns:
+                            close_column = col_name
+                            break
+                
+                if close_column is not None:
+                    # Ensure we get a clean numpy array
+                    close_prices = symbol_data[close_column].values
+                    if isinstance(close_prices, (list, tuple)):
+                        close_prices = np.array(close_prices, dtype=np.float32)
+                    else:
+                        close_prices = np.asarray(close_prices, dtype=np.float32)
+                    
+                    # Handle any NaN values
+                    if np.any(np.isnan(close_prices)):
+                        # Replace NaN with forward fill, then backward fill
+                        close_prices = pd.Series(close_prices).fillna(method='ffill').fillna(method='bfill').values
+                        close_prices = np.asarray(close_prices, dtype=np.float32)
+                    
+                    # Ensure we have enough data
+                    if len(close_prices) < self.lookback_window:
+                        # Pad with the last known price
+                        padding = np.full(self.lookback_window - len(close_prices), close_prices[-1] if len(close_prices) > 0 else 100.0, dtype=np.float32)
+                        close_prices = np.concatenate([padding, close_prices])
+                    
+                    prefetched_data[symbol] = close_prices
+                    logger.debug(f"Prefetched {len(close_prices)} close prices for {symbol}")
+                else:
+                    logger.warning(f"No close price column found for {symbol}. Available columns: {list(symbol_data.columns)}")
+                    # Provide dummy data
                     prefetched_data[symbol] = np.full(
-                        self.lookback_window + 1, 100.0, dtype=np.float32 # Ensure enough for lookback
+                        self.lookback_window + 1, 100.0, dtype=np.float32
                     )
             except Exception as e:
                 logger.error(f"Error prefetching data for {symbol}: {e}", exc_info=True)
                 # Create dummy data if prefetching fails to prevent crashes
                 prefetched_data[symbol] = np.full(
                     self.lookback_window + 1, 100.0, dtype=np.float32
-                ) # Ensure enough for lookback
+                )
 
         return prefetched_data
+
+# Removed unused fetch function

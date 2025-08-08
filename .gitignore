@@ -184,3 +184,5 @@ test_results.png
 hyperparameters.json
 prompt.txt
 benchmark_performance.png
+train_fast_results.png  
+training_performance.png

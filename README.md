@@ -1,292 +1,127 @@
-# StockBot2-Experimental
+# StockBot2 - Automated Trading with Deep Reinforcement Learning
 
-A sophisticated algorithmic trading system that uses Deep Reinforcement Learning (DRL) to make autonomous trading decisions. This experimental version features advanced GPU optimization, hyperparameter tuning, and robust live trading capabilities through the Alpaca API.
+A streamlined deep reinforcement learning system for automated stock trading using DDPG (Deep Deterministic Policy Gradients).
 
-## 🚀 Key Features
+## Features
 
-- **Deep Reinforcement Learning Agent**: DDPG (Deep Deterministic Policy Gradient) architecture with Actor-Critic networks
-- **GPU Acceleration**: Optimized for RTX 3090 with mixed precision training and XLA JIT compilation
-- **Live Trading Integration**: Seamless connection to Alpaca API for paper/live trading
-- **Hyperparameter Optimization**: Automated tuning using Optuna for optimal performance
-- **Robust Data Handling**: Multi-source data fetching with caching and fallback mechanisms
-- **Automated Execution**: Cron-based automation for daily trading and weekly training
-- **Advanced State Representation**: Enhanced market state encoding with historical data
-- **Risk Management**: Built-in position limits and wash trade prevention
+- **Unified Training Pipeline**: Single training mode with monitoring and checkpointing
+- **GPU Acceleration**: Optimized for CUDA with fallback to CPU
+- **Live Trading**: Integration with Alpaca Markets API
+- **Automated Training**: Scheduled training sessions with monitoring
+- **Data Caching**: Efficient data management with yfinance and Alpaca
 
-## 📁 Project Structure
+## Quick Start
 
-### Core Components
-
-| File                     | Purpose                           | Key Features                                                                           |
-| ------------------------ | --------------------------------- | -------------------------------------------------------------------------------------- |
-| `main.py`                | Main application entry point      | Orchestrates training, testing, optimization, and live trading modes                   |
-| `drl_agent.py`           | Deep Reinforcement Learning agent | DDPG implementation with Actor-Critic networks, experience replay, and target networks |
-| `stock_env.py`           | Trading environment simulation    | Market simulation with realistic trading constraints and reward calculation            |
-| `alpaca_trade_system.py` | Live trading interface            | Real-time order execution and portfolio management via Alpaca API                      |
-| `config.py`              | Configuration management          | Centralized settings, API credentials, and hyperparameter management                   |
-
-### Supporting Modules
-
-| File                    | Purpose                      | Key Features                                                                     |
-| ----------------------- | ---------------------------- | -------------------------------------------------------------------------------- |
-| `replay_buffer.py`      | Experience replay buffer     | Efficient memory management for DRL training with TensorFlow dataset integration |
-| `noise.py`              | Exploration noise generation | Ornstein-Uhlenbeck process for improved exploration during training              |
-| `utils.py`              | Utility functions            | Cache invalidation and data management utilities                                 |
-| `data_fetch_testing.py` | Data fetching utilities      | Testing and validation tools for Alpaca API data retrieval                       |
-
-### Configuration & Data
-
-| File                   | Purpose               | Contents                                                           |
-| ---------------------- | --------------------- | ------------------------------------------------------------------ |
-| `config.py`            | Central configuration | API keys, trading parameters, model hyperparameters                |
-| `stocks.json`          | Trading universe      | List of stock symbols to trade (27 major stocks)                   |
-| `requirements.txt`     | Dependencies          | Python packages including TensorFlow, Alpaca-py, Optuna            |
-| `market_automation.sh` | Automation script     | Cron job setup for automated trading and training                  |
-| `setup_env.py`         | Environment setup     | Interactive script to configure API credentials and validate setup |
-
-## 🧠 Architecture Overview
-
-### Deep Reinforcement Learning Agent (`drl_agent.py`)
-
-The DRL agent implements a DDPG architecture with the following components:
-
-- **Actor Network**: Determines trading actions (buy/sell/hold) for each stock
-- **Critic Network**: Evaluates the quality of actions and estimates Q-values
-- **Target Networks**: Stable learning through soft target updates
-- **Experience Replay**: Efficient memory management with TensorFlow datasets
-- **Ornstein-Uhlenbeck Noise**: Improved exploration during training
-
-### Trading Environment (`stock_env.py`)
-
-The environment provides a realistic simulation of stock trading:
-
-- **Multi-Symbol Trading**: Supports trading multiple stocks simultaneously
-- **Historical Data Integration**: Uses Alpaca API and yfinance as fallback
-- **State Representation**: Encodes current prices, positions, balance, and historical data
-- **Reward Calculation**: Portfolio value changes with transaction costs
-- **Trading Constraints**: Position limits and realistic market conditions
-
-### Live Trading System (`alpaca_trade_system.py`)
-
-Handles real-time trading execution:
-
-- **Real-Time Data**: Fetches current market data from Alpaca
-- **Order Execution**: Converts agent decisions into market orders
-- **Portfolio Tracking**: Monitors positions and account balance
-- **Error Handling**: Robust retry mechanisms and error recovery
-
-## 🛠️ Installation & Setup
-
-### Prerequisites
-
-- Python 3.8+
-- NVIDIA GPU with CUDA support (recommended)
-- Alpaca trading account (paper or live)
-
-### Installation
-
-1. **Clone the repository:**
-
-   ```bash
-   git clone <repository-url>
-   cd StockBot2-Experimental
-   ```
-
-2. **Create virtual environment:**
-
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-3. **Install dependencies:**
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Configure environment:**
-
-   ```bash
-   # Run the setup script to configure your environment
-   python setup_env.py
-
-   # Or manually create .env file:
-   # cp .env.example .env
-   # Edit .env with your Alpaca API credentials
-   ```
-
-## 🎯 Usage Modes
-
-### Training Mode
-
+### 1. Setup Environment
 ```bash
-python main.py --mode train --epochs 1000 --gpu
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-- Trains the DRL agent on historical data
-- Saves best models to `./models/`
-- Includes early stopping and checkpointing
-
-### Testing Mode
-
-```bash
-python main.py --mode test --episodes 50
+### 2. Configure API Keys (Optional - for live trading)
+Create a `.env` file:
+```
+ALPACA_API_KEY=your_key_here
+ALPACA_SECRET_KEY=your_secret_here
+ALPACA_PAPER_TRADING=true
 ```
 
-- Evaluates trained agent on unseen data
-- Generates performance visualizations
-- Creates `test_results.png` and `final_values_distribution.png`
-- Use `--episodes` to control number of test episodes (default: 100)
-
-### Hyperparameter Optimization
-
+### 3. Train the Model
 ```bash
-python main.py --mode optimize --trials 100
+# Basic training
+python3 main.py --mode train --epochs 100
+
+# Test trained model
+python3 main.py --mode test
 ```
 
-- Uses Optuna for automated hyperparameter tuning
-- Optimizes learning rate, batch size, gamma, noise parameters
-- Saves best parameters to `hyperparameters.json`
-
-### Live Trading
-
+### 4. Automated Training
 ```bash
-python main.py --mode live
+# Run automated training sessions
+python3 auto_train.py --epochs 50 --sessions 10 --interval 60
+
+# Run single training session
+python3 auto_train.py --run-once --epochs 25
 ```
 
-- Connects to Alpaca API for real-time trading
-- Executes agent decisions in live market
-- Includes robust error handling and retry logic
+## Usage Examples
 
-## 🤖 Automation
-
-The `market_automation.sh` script provides automated execution:
-
-### Setup Automation
-
+### Manual Training
 ```bash
-./market_automation.sh install
+# Train for 100 epochs
+python3 main.py --mode train --epochs 100
+
+# Test current model
+python3 main.py --mode test
+
+# Live trading (requires API keys)
+python3 main.py --mode live
 ```
 
-### Cron Jobs Created
-
-- **Weekday Trading**: 9 AM daily for live trading
-- **Friday Training**: 4:30 PM for weekly model retraining
-- **Saturday Optimization**: 10 PM for hyperparameter tuning
-- **Reboot Recovery**: 5 minutes after system restart
-
-### Manual Execution
-
+### Automated Training
 ```bash
-./market_automation.sh live      # Start live trading
-./market_automation.sh training  # Start training
-./market_automation.sh optimize  # Start optimization
+# Standard automation: 50 epochs every hour, max 10 sessions
+python3 auto_train.py
+
+# Custom configuration
+python3 auto_train.py --epochs 25 --sessions 20 --interval 30
+
+# Quick single session
+python3 auto_train.py --run-once --epochs 10
 ```
 
-## 📊 Configuration
+## Configuration
 
-### Trading Parameters (`config.py`)
+Key parameters in `config.py`:
+- `STOCK_SYMBOLS`: List of stocks to trade
+- `INITIAL_BALANCE`: Starting portfolio balance
+- `TRAINING_EPISODES`: Episodes per training session
+- `LEARNING_RATE`: Neural network learning rate
+- `BATCH_SIZE`: Training batch size
 
-- **Initial Balance**: $1,000 starting capital
-- **Stock Universe**: 27 major stocks (AAPL, MSFT, GOOGL, etc.)
-- **Lookback Window**: 168 time steps of historical data
-- **Max Shares**: 5 shares per trade limit
-- **Trading Frequency**: Hourly trading decisions
+## File Structure
 
-### Model Parameters
+```
+StockBot2-Experimental/
+├── main.py              # Main training/testing entry point
+├── auto_train.py        # Automated training scheduler
+├── config.py            # Configuration parameters
+├── stock_env.py         # Trading environment
+├── drl_agent.py         # DDPG agent implementation
+├── replay_buffer.py     # Experience replay buffer
+├── noise.py             # Exploration noise
+├── utils.py             # Utility functions
+├── performance_monitor.py # GPU/performance monitoring
+├── alpaca_trade_system.py # Live trading system
+└── requirements.txt     # Dependencies
+```
 
-- **State Dimension**: Dynamic based on number of stocks
-- **Action Dimension**: One action per stock
-- **Learning Rate**: 0.0001 (optimizable)
-- **Batch Size**: 4096 (optimized for RTX 3090)
-- **Memory Size**: 100,000 experiences
+## Monitoring
 
-## 📈 Performance Monitoring
+Training progress is logged to:
+- Console output
+- `app.log` (training logs)
+- `auto_train.log` (automation logs)
 
-### Logging
+Performance metrics include:
+- Episode rewards
+- Portfolio value
+- Training losses
+- GPU utilization
 
-- Comprehensive logging to `app.log`
-- Real-time performance metrics
-- Error tracking and debugging information
+## Live Trading
 
-### Visualizations
+⚠️ **Paper Trading Recommended**: Use `ALPACA_PAPER_TRADING=true` for testing.
 
-- Portfolio value over time plots
-- Final value distribution histograms
-- Training progress with loss curves
+The system supports live trading through Alpaca Markets:
+1. Set up API credentials in `.env`
+2. Run `python3 main.py --mode live`
+3. Monitor trades through Alpaca dashboard
 
-### Model Checkpoints
+## Tips
 
-- Automatic model saving during training
-- Best model preservation
-- Checkpoint recovery capabilities
-
-## 🔧 Advanced Features
-
-### GPU Optimization
-
-- Mixed precision training for RTX 3090
-- XLA JIT compilation
-- Memory growth management
-- Efficient data prefetching
-
-### Data Management
-
-- Intelligent caching system
-- Parallel data fetching
-- Fallback data sources (yfinance)
-- Cache invalidation strategies
-
-### Risk Management
-
-- Position size limits
-- Wash trade prevention
-- Transaction cost modeling
-- Portfolio diversification
-
-## ⚠️ Important Notes
-
-### Disclaimer
-
-This project is for **educational and experimental purposes only**. Algorithmic trading involves significant financial risks. The creators are not responsible for any financial losses.
-
-### Paper Trading
-
-The system defaults to paper trading mode. Enable live trading only after thorough testing and understanding of the risks.
-
-### Model Limitations
-
-- Historical performance doesn't guarantee future results
-- Market conditions change, requiring regular retraining
-- The agent may not perform well in all market conditions
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-1. **GPU Memory Errors**: Reduce batch size in `config.py`
-2. **API Rate Limits**: Implement longer delays between requests
-3. **Data Fetching Errors**: Check API credentials and network connectivity
-4. **Training Instability**: Adjust learning rate or noise parameters
-
-### Debug Mode
-
-Enable detailed logging by modifying the logging level in individual modules.
-
-## 📚 Dependencies
-
-- **TensorFlow**: Deep learning framework
-- **Alpaca-py**: Trading API client
-- **Optuna**: Hyperparameter optimization
-- **Pandas/NumPy**: Data manipulation
-- **Matplotlib**: Visualization
-- **Python-dotenv**: Environment management
-
-## 🤝 Contributing
-
-This is an experimental project. Contributions are welcome but should be thoroughly tested before integration.
-
-## 📄 License
-
-This project is provided as-is for educational purposes. Use at your own risk.
+- Start with paper trading to validate strategies
+- Use automated training for hands-off model improvement
+- Monitor GPU usage for optimal performance
+- Regular checkpoints prevent training loss

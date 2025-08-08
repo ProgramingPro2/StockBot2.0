@@ -28,9 +28,35 @@ class ReplayBuffer:
         self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.dones = np.zeros(capacity, dtype=np.float32)
 
+        # GPU acceleration setup - only use if memory allows
+        self.device = '/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'
+        self.use_gpu_tensors = False
+        
+        # Calculate memory requirements
+        total_memory_needed = capacity * (state_dim + action_dim + 2) * 4  # 4 bytes per float32
+        gpu_memory_available = 8 * 1024 * 1024 * 1024  # 8GB in bytes
+        
+        if self.device == '/GPU:0' and total_memory_needed < gpu_memory_available * 0.5:  # Use 50% of GPU memory max
+            try:
+                # Pre-allocate GPU tensors for faster operations
+                with tf.device(self.device):
+                    self.states_gpu = tf.Variable(tf.zeros((capacity, state_dim), dtype=tf.float32))
+                    self.actions_gpu = tf.Variable(tf.zeros((capacity, action_dim), dtype=tf.float32))
+                    self.rewards_gpu = tf.Variable(tf.zeros(capacity, dtype=tf.float32))
+                    self.next_states_gpu = tf.Variable(tf.zeros((capacity, state_dim), dtype=tf.float32))
+                    self.dones_gpu = tf.Variable(tf.zeros(capacity, dtype=tf.float32))
+                self.use_gpu_tensors = True
+                print(f"Using GPU tensors for replay buffer. Memory usage: {total_memory_needed / (1024**3):.2f} GB")
+            except Exception as e:
+                print(f"Failed to allocate GPU tensors, falling back to CPU: {e}")
+                self.use_gpu_tensors = False
+        else:
+            print(f"Using CPU tensors for replay buffer. Memory needed: {total_memory_needed / (1024**3):.2f} GB")
+            self.use_gpu_tensors = False
+
     def push(self, state, action, reward, next_state, done):
         """
-        Stores an experience in the replay buffer.
+        Stores an experience in the replay buffer with GPU acceleration.
 
         Args:
             state: The current state.
@@ -45,6 +71,20 @@ class ReplayBuffer:
         self.rewards[self.position] = reward
         self.next_states[self.position] = next_state
         self.dones[self.position] = float(done)
+
+        # GPU acceleration: Update GPU tensors only if available
+        if self.use_gpu_tensors:
+            try:
+                with tf.device(self.device):
+                    self.states_gpu[self.position].assign(state)
+                    self.actions_gpu[self.position].assign(action)
+                    self.rewards_gpu[self.position].assign(reward)
+                    self.next_states_gpu[self.position].assign(next_state)
+                    self.dones_gpu[self.position].assign(float(done))
+            except Exception as e:
+                # If GPU operations fail, disable GPU tensors
+                print(f"GPU tensor operation failed, disabling GPU tensors: {e}")
+                self.use_gpu_tensors = False
 
         # Update position and size
         self.position = (self.position + 1) % self.capacity
@@ -63,12 +103,32 @@ class ReplayBuffer:
         if self.size == 0:
             return None
 
-        # Create tensors directly from numpy arrays for better performance
-        states_tensor = tf.convert_to_tensor(self.states[:self.size], dtype=tf.float32)
-        actions_tensor = tf.convert_to_tensor(self.actions[:self.size], dtype=tf.float32)
-        rewards_tensor = tf.convert_to_tensor(self.rewards[:self.size], dtype=tf.float32)
-        next_states_tensor = tf.convert_to_tensor(self.next_states[:self.size], dtype=tf.float32)
-        dones_tensor = tf.convert_to_tensor(self.dones[:self.size], dtype=tf.float32)
+        # Use GPU tensors if available for faster dataset creation
+        if self.use_gpu_tensors:
+            try:
+                with tf.device(self.device):
+                    # Create tensors directly from GPU memory
+                    states_tensor = self.states_gpu[:self.size]
+                    actions_tensor = self.actions_gpu[:self.size]
+                    rewards_tensor = self.rewards_gpu[:self.size]
+                    next_states_tensor = self.next_states_gpu[:self.size]
+                    dones_tensor = self.dones_gpu[:self.size]
+            except Exception as e:
+                print(f"GPU tensor access failed, falling back to CPU: {e}")
+                self.use_gpu_tensors = False
+                # Fall through to CPU tensors
+                states_tensor = tf.convert_to_tensor(self.states[:self.size], dtype=tf.float32)
+                actions_tensor = tf.convert_to_tensor(self.actions[:self.size], dtype=tf.float32)
+                rewards_tensor = tf.convert_to_tensor(self.rewards[:self.size], dtype=tf.float32)
+                next_states_tensor = tf.convert_to_tensor(self.next_states[:self.size], dtype=tf.float32)
+                dones_tensor = tf.convert_to_tensor(self.dones[:self.size], dtype=tf.float32)
+        else:
+            # Fallback to CPU tensors
+            states_tensor = tf.convert_to_tensor(self.states[:self.size], dtype=tf.float32)
+            actions_tensor = tf.convert_to_tensor(self.actions[:self.size], dtype=tf.float32)
+            rewards_tensor = tf.convert_to_tensor(self.rewards[:self.size], dtype=tf.float32)
+            next_states_tensor = tf.convert_to_tensor(self.next_states[:self.size], dtype=tf.float32)
+            dones_tensor = tf.convert_to_tensor(self.dones[:self.size], dtype=tf.float32)
 
         # Create dataset with optimized settings
         dataset = tf.data.Dataset.from_tensor_slices(
@@ -80,6 +140,7 @@ class ReplayBuffer:
             dataset
             .shuffle(buffer_size=min(self.size, 10000), reshuffle_each_iteration=True)
             .batch(batch_size, drop_remainder=True)  # Drop remainder for consistent batch sizes
+            .repeat()  # Make dataset repeat infinitely to prevent "End of sequence"
             .prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
             .cache()  # Cache the dataset in memory for faster access
         )

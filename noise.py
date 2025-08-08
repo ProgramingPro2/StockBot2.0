@@ -29,7 +29,7 @@ class OrnsteinUhlenbeckActionNoise:
         Generates the next noise value.
 
         Returns:
-            The next noise value.
+            The next noise value as float32.
         """
         x = (
             self.x_prev
@@ -37,7 +37,7 @@ class OrnsteinUhlenbeckActionNoise:
             + self.sigma * np.sqrt(self.dt) * np.random.normal(size=self.mu.shape)
         )
         self.x_prev = x
-        return x
+        return x.astype(np.float32)
 
     def reset(self):
         """Resets the noise to its initial state."""

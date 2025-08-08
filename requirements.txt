@@ -1,7 +1,7 @@
 pandas
 numpy
 alpaca-py
-tensorflow
+tensorflow>=2.4.0
 matplotlib
 python-dotenv
 joblib
@@ -12,3 +12,4 @@ psutil
 GPUtil
 yfinance
 requests
+schedule

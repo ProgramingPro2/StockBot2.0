@@ -1,6 +1,17 @@
 import numpy as np
 import time
 import sys
+import os
+
+# Set TensorFlow environment variables to suppress warnings and optimize performance
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'  # Enable oneDNN optimizations
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Allow GPU memory growth
+
+# Set matplotlib to use non-interactive backend to prevent Tkinter issues
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
 from datetime import datetime, timedelta
@@ -49,24 +60,37 @@ tf.config.optimizer.set_experimental_options({
 })
 
 # Enable mixed precision for faster training on modern GPUs
-policy = tf.keras.mixed_precision.Policy('mixed_float16')
+# Temporarily disabled for compatibility
+# policy = tf.keras.mixed_precision.Policy('mixed_float16')
+# tf.keras.mixed_precision.set_global_policy(policy)
+
+# Use float32 for better compatibility
+policy = tf.keras.mixed_precision.Policy('float32')
 tf.keras.mixed_precision.set_global_policy(policy)
 
-# Check for GPU availability
+# GPU memory optimization - Set memory growth BEFORE configuring virtual devices
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
-        # Currently, memory growth needs to be the same across GPUs
+        # Set memory growth for all GPUs FIRST
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-            # Set memory limit to 90% of available GPU memory
+        
+        # Then configure virtual devices if needed
+        for gpu in gpus:
+            # Set memory limit to 6GB for better performance
             tf.config.set_logical_device_configuration(
                 gpu,
-                [tf.config.LogicalDeviceConfiguration(memory_limit=1024*9)]  # 9GB limit
+                [tf.config.LogicalDeviceConfiguration(memory_limit=1024*6)]  # 6GB limit for better performance
             )
+        
         logical_gpus = tf.config.list_logical_devices('GPU')
         print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
         logger.info(f"GPU is available. Found {len(gpus)} GPU(s).")
+        
+        # Set default device to GPU
+        tf.config.set_visible_devices(gpus[0], 'GPU')
+        logger.info("Default device set to GPU")
     except RuntimeError as e:
         # Memory growth must be set before GPUs have been initialized
         logger.error(f"GPU configuration failed: {e}")
@@ -80,33 +104,16 @@ tf.config.run_functions_eagerly(False)
 dotenv.load_dotenv()
 
 def check_system_health():
-    """
-    Performs system health checks before starting operations.
-    
-    Returns:
-        bool: True if all checks pass, False otherwise
-    """
-    logger.info("Performing system health checks...")
-    
-    # Check API credentials
-    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-        logger.error("Alpaca API credentials not found. Please set ALPACA_API_KEY and ALPACA_SECRET_KEY in your .env file")
-        return False
-    
-    # Check GPU availability
+    """Basic system health checks."""
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
         logger.info(f"GPU detected: {len(gpus)} physical GPU(s)")
     else:
         logger.warning("No GPU detected. Training will be slower on CPU")
     
-    # Check required directories
-    required_dirs = ["./models", "./data_cache", "./checkpoints"]
-    for dir_path in required_dirs:
+    for dir_path in ["./models", "./data_cache", "./checkpoints"]:
         Path(dir_path).mkdir(exist_ok=True)
-        logger.info(f"Directory ready: {dir_path}")
     
-    # Check stock symbols
     if not STOCK_SYMBOLS:
         logger.error("No stock symbols configured")
         return False
@@ -114,160 +121,16 @@ def check_system_health():
     logger.info(f"Health checks passed. Trading {len(STOCK_SYMBOLS)} symbols")
     return True
 
-# Connect to Alpaca API with error handling
-try:
-    trading_client = TradingClient(
-        ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER_TRADING
-    )
-    stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-    logger.info("Successfully connected to Alpaca API")
-except Exception as e:
-    logger.error(f"Failed to connect to Alpaca API: {e}")
-    logger.error("Please check your API credentials in the .env file")
-    raise
+# Defer Alpaca connections until needed (avoids requiring keys for yfinance training)
+trading_client = None
+stock_data_client = None
 
 
-def optimize_agent(optimization_episodes=200, optimization_test_trials=50):
-    """
-    Performs hyperparameter optimization using Optuna.
-
-    Args:
-        optimization_episodes: Number of episodes to train the agent for during each trial.
-        optimization_test_trials: Number of trials to test the agent for during each optimization.
-    """
-    logger.info("Starting hyperparameter optimization...")
-
-    def objective(trial):
-        # Suggest hyperparameters
-        learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
-        batch_size = trial.suggest_categorical(
-            "batch_size", [256, 512, 1024, 2048, 4096]
-        )
-        gamma = trial.suggest_float("gamma", 0.9, 0.99)
-        noise_sigma = trial.suggest_float("noise_sigma", 0.05, 0.3)
-        noise_theta = trial.suggest_float("noise_theta", 0.1, 0.5)
-        reward_scaling_factor = trial.suggest_float(
-            "reward_scaling_factor", 0.1, 10.0, log=True
-        )
-
-        # Update global parameters or pass them to the agent
-        global LEARNING_RATE, BATCH_SIZE, GAMMA
-        LEARNING_RATE = learning_rate
-        BATCH_SIZE = batch_size
-        GAMMA = gamma
-
-        logger.info(
-            f"Trial {trial.number}: LR={learning_rate:.6f}, BS={batch_size}, Gamma={gamma:.3f}"
-        )
-
-        # Train the agent with suggested hyperparameters
-        invalidate_cache(days=0)
-        StockTradingEnvironment.clear_in_memory_cache()
-        env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, reward_scaling_factor)
-        agent = DRLAgent(
-            STATE_DIM,
-            ACTION_DIM,
-            learning_rate,
-            gamma,
-            MEMORY_SIZE,
-            noise_sigma=noise_sigma,
-            noise_theta=noise_theta,
-        )
-        agent.gamma = gamma  # Ensure agent uses the trial's gamma
-
-        # Pre-fill replay buffer
-        logger.info(f"Pre-filling replay buffer with {batch_size} experiences for trial {trial.number}...")
-        progress_bar_prefill = tqdm(total=batch_size, desc=f"Trial {trial.number} Pre-filling")
-        while len(agent.memory) < batch_size:
-            state = env.reset()
-            done = False
-            while not done and len(agent.memory) < batch_size:
-                action = agent.act(state, explore=True)
-                next_state, reward, done, _ = env.step(action)
-                agent.remember(state, action, reward, next_state, done)
-                state = next_state
-                progress_bar_prefill.update(1)
-        progress_bar_prefill.close()
-
-        dataset_iterator = None
-
-        for episode in tqdm(
-            range(optimization_episodes), desc=f"Trial {trial.number} Training"
-        ):  # Add tqdm here
-            state = env.reset()
-            done = False
-            while not done:
-                action = agent.act(state)
-                next_state, reward, done, _ = env.step(action)
-                agent.remember(state, action, reward, next_state, done)
-                state = next_state
-
-            if len(agent.memory) >= BATCH_SIZE:
-                if dataset_iterator is None:
-                    dataset = agent.memory.as_dataset(BATCH_SIZE)
-                    if dataset:
-                        dataset_iterator = iter(dataset)
-
-                if dataset_iterator:
-                    for _ in range(2):  # Train less frequently during optimization
-                        agent.train(dataset_iterator)
-
-        # Test the agent and return the mean final portfolio value
-        invalidate_cache(days=0)
-        StockTradingEnvironment.clear_in_memory_cache()
-        test_env = StockTradingEnvironment(
-            STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, reward_scaling_factor
-        )
-        final_values = []
-        for _ in tqdm(
-            range(optimization_test_trials), desc=f"Trial {trial.number} Testing"
-        ):  # Add tqdm here
-            state = test_env.reset()
-            done = False
-            while not done:
-                action = agent.act(state, explore=False)
-                next_state, _, done, info = test_env.step(action)
-                state = next_state
-            final_values.append(info["portfolio_value"])
-
-        mean_final_value = np.mean(final_values)
-        logger.info(
-            f"Trial {trial.number} finished with mean portfolio value: ${mean_final_value:.2f}"
-        )
-        return mean_final_value
-
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=args.trials, show_progress_bar=True)
-
-    logger.info("Optimization finished.")
-    logger.info(
-        f"""Best trial:
-  Value: {study.best_value:.2f}
-  Params: {study.best_params}"""
-    )
-
-    # Update global parameters with the best found
-    global LEARNING_RATE, BATCH_SIZE, GAMMA, REWARD_SCALING_FACTOR
-    LEARNING_RATE = study.best_params["learning_rate"]
-    BATCH_SIZE = study.best_params["batch_size"]
-    GAMMA = study.best_params["gamma"]
-    REWARD_SCALING_FACTOR = study.best_params["reward_scaling_factor"]
-
-    logger.info("Global hyperparameters updated to best found values.")
-
-    # Save best hyperparameters to a file
-    hyperparams_path = Path("./hyperparameters.json")
-    with open(hyperparams_path, "w") as f:
-        json.dump(study.best_params, f, indent=4)
-    logger.info(f"Best hyperparameters saved to {hyperparams_path}")
+# Removed optimization function - use unified training instead
 
 
 def train_agent():
-    """Trains the DRL agent using historical data with optimized GPU acceleration.
-
-    Returns:
-        The trained DRLAgent instance.
-    """
+    """Unified training pipeline with monitoring, checkpointing, and testing."""
     # Start performance monitoring
     monitor = PerformanceMonitor(log_interval=10)
     monitor.start_monitoring()
@@ -289,12 +152,13 @@ def train_agent():
     )
 
     # Pre-fill replay buffer with more experiences for better initial training
-    logger.info(f"Pre-filling replay buffer with {BATCH_SIZE * 2} experiences...")
-    progress_bar_prefill = tqdm(total=BATCH_SIZE * 2, desc="Pre-filling Buffer")
-    while len(agent.memory) < BATCH_SIZE * 2:
+    prefill_size = min(BATCH_SIZE, 2048)  # Reasonable prefill
+    logger.info(f"Pre-filling replay buffer with {prefill_size} experiences...")
+    progress_bar_prefill = tqdm(total=prefill_size, desc="Pre-filling Buffer")
+    while len(agent.memory) < prefill_size:
         state = env.reset()
         done = False
-        while not done and len(agent.memory) < BATCH_SIZE * 2:
+        while not done and len(agent.memory) < prefill_size:
             action = agent.act(state, explore=True) # Use random actions
             next_state, reward, done, _ = env.step(action)
             agent.remember(state, action, reward, next_state, done)
@@ -312,11 +176,11 @@ def train_agent():
         return agent
 
     best_reward = -np.inf
-    checkpoint_interval = 50  # Save every 50 episodes
-    early_stopping_patience = 10
+    checkpoint_interval = 25
+    early_stopping_patience = 8
     early_stopping_counter = 0
-    warmup_episodes = 100
-    reward_history = deque(maxlen=100)
+    warmup_episodes = 50  # Reduced from 100 for faster warmup
+    reward_history = deque(maxlen=50)  # Reduced from 100 for faster adaptation
     
     # Performance optimization: Pre-allocate arrays for batch processing
     episode_states = []
@@ -326,7 +190,7 @@ def train_agent():
     episode_dones = []
     
     # Training frequency optimization
-    training_frequency = 4  # Train every 4 steps instead of every step
+    training_frequency = 1
     steps_since_training = 0
 
     # Create a progress bar for training
@@ -356,27 +220,20 @@ def train_agent():
         # Batch train on collected experiences for better efficiency
         if len(agent.memory) >= BATCH_SIZE and steps_since_training >= training_frequency:
             # Train multiple times per episode for better learning
-            for _ in range(8):  # Increased from 4 to 8 for better convergence
-                try:
-                    losses = agent.train(dataset_iterator)
-                    if losses:
-                        episode_losses.append(losses)
-                except StopIteration:
-                    # Recreate iterator if exhausted
-                    dataset = agent.memory.as_dataset(BATCH_SIZE)
-                    if dataset:
-                        dataset_iterator = iter(dataset)
-                    break
+            for _ in range(4):
+                losses = agent.train(dataset_iterator)
+                if losses:
+                    episode_losses.append(losses)
             steps_since_training = 0
 
         # Calculate mean losses for this episode
         if episode_losses:
             mean_actor_loss = np.mean(
-                [loss["actor_loss"] for loss in episode_losses if "actor_loss" in loss]
+                [float(loss["actor_loss"]) for loss in episode_losses if "actor_loss" in loss]
             )
             mean_critic_loss = np.mean(
                 [
-                    loss["critic_loss"]
+                    float(loss["critic_loss"])
                     for loss in episode_losses
                     if "critic_loss" in loss
                 ]
@@ -429,10 +286,13 @@ def train_agent():
     monitor.print_summary()
     monitor.plot_performance("training_performance.png")
 
-    # Test the trained agent
-    test_agent(agent)
+    # Quick test after training
+    test_agent(agent, episodes=5)
 
     return agent
+
+
+# Removed fast training - unified into main train_agent
 
 
 def test_agent(agent=None, episodes=None):
@@ -495,106 +355,45 @@ def test_agent(agent=None, episodes=None):
         f"Testing completed. Mean final portfolio value: ${mean_final_value:.2f} \u00b1 ${std_final_value:.2f}"
     )
 
-    # Plot results
-    plt.figure(figsize=(12, 8))
-
-    # Plot results
-    plt.figure(figsize=(14, 8))  # Slightly larger figure for better readability
-
-    # Determine the maximum length of all portfolio value histories
-    max_len = max(len(p) for p in portfolio_values)
-
-    # Align all portfolio histories to the maximum length for accurate averaging
-    aligned_portfolios = []
-    for p in portfolio_values:
-        try:
-            # Ensure p is a flat list/array and handle any conversion issues
-            if isinstance(p, (list, tuple)):
-                # Flatten the list if it contains nested structures
-                p_flat = []
-                for item in p:
-                    if isinstance(item, (list, tuple)):
-                        p_flat.extend(item)
-                    else:
-                        p_flat.append(float(item))
-                p_array = np.array(p_flat, dtype=np.float64)
-            else:
-                p_array = np.array(p, dtype=np.float64)
-            
-            # Ensure it's 1D
-            if p_array.ndim > 1:
-                p_array = p_array.flatten()
-            
-            padded = np.pad(p_array, (0, max_len - len(p_array)), 'edge')
-            aligned_portfolios.append(padded)
-        except Exception as e:
-            logger.warning(f"Error processing portfolio values: {e}, using default")
-            # Use a default array if processing fails
-            default_array = np.full(max_len, INITIAL_BALANCE, dtype=np.float64)
-            aligned_portfolios.append(default_array)
-
-    # Plot average portfolio value
-    avg_portfolio = np.mean(aligned_portfolios, axis=0)
-    plt.plot(avg_portfolio, "b-", linewidth=2, label="Average Portfolio Value")
-
-    # Plot confidence interval (if enough data)
-    if len(aligned_portfolios) > 1:
-        std_portfolio = np.std(aligned_portfolios, axis=0)
-        plt.fill_between(
-            range(len(avg_portfolio)),
-            avg_portfolio - std_portfolio,
-            avg_portfolio + std_portfolio,
-            color="blue",
-            alpha=0.2,
-            label="Standard Deviation",
-        )
-
-    # Plot some individual episodes for visual variety
-    num_episodes_to_plot = min(
-        10, len(portfolio_values)
-    )  # Plot more individual episodes
-    for i in np.random.choice(
-        len(portfolio_values), num_episodes_to_plot, replace=False
-    ):
-        plt.plot(portfolio_values[i], "r-", alpha=0.15)  # Make individual lines lighter
-
-    plt.title("Portfolio Value During Testing Episodes", fontsize=16)
-    plt.xlabel("Trading Steps", fontsize=12)
-    plt.ylabel("Portfolio Value ($)", fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True, linestyle="--", alpha=0.7)
-    plt.tight_layout()  # Adjust layout to prevent labels from overlapping
-    plt.savefig(
-        "test_results.png", dpi=600, bbox_inches="tight"
-    )  # Save with tight bounding box
+    # Simple plotting
+    plt.figure(figsize=(12, 6))
+    
+    # Plot average and individual episodes
+    if portfolio_values:
+        max_len = max(len(p) for p in portfolio_values)
+        aligned = []
+        for p in portfolio_values:
+            try:
+                p_array = np.array(p, dtype=np.float64).flatten()
+                padded = np.pad(p_array, (0, max_len - len(p_array)), 'edge')
+                aligned.append(padded)
+            except:
+                aligned.append(np.full(max_len, INITIAL_BALANCE, dtype=np.float64))
+        
+        avg_portfolio = np.mean(aligned, axis=0)
+        plt.plot(avg_portfolio, "b-", linewidth=2, label="Average")
+        
+        # Plot a few individual episodes
+        for i in range(min(5, len(portfolio_values))):
+            plt.plot(portfolio_values[i], "r-", alpha=0.3)
+    
+    plt.title("Portfolio Performance")
+    plt.xlabel("Steps")
+    plt.ylabel("Value ($)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig("test_results.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    # Plot the distribution of final values
-    plt.figure(figsize=(10, 7))  # Slightly larger figure
-    plt.hist(
-        final_values, bins=30, alpha=0.8, color="skyblue", edgecolor="black"
-    )  # More bins, better color
-    plt.axvline(
-        mean_final_value,
-        color="red",
-        linestyle="dashed",
-        linewidth=2,
-        label=f"Mean: ${mean_final_value:.2f}",
-    )
-    plt.axvline(
-        median_final_value,
-        color="green",
-        linestyle="dashed",
-        linewidth=2,
-        label=f"Median: ${median_final_value:.2f}",
-    )
-    plt.title("Distribution of Final Portfolio Values", fontsize=16)
-    plt.xlabel("Final Portfolio Value ($)", fontsize=12)
-    plt.ylabel("Frequency", fontsize=12)
-    plt.legend(fontsize=10)
-    plt.grid(True, linestyle="--", alpha=0.7)
-    plt.tight_layout()
-    plt.savefig("final_values_distribution.png", dpi=600, bbox_inches="tight")
+    # Distribution plot
+    plt.figure(figsize=(8, 5))
+    plt.hist(final_values, bins=20, alpha=0.7, color="skyblue")
+    plt.axvline(mean_final_value, color="red", linestyle="--", label=f"Mean: ${mean_final_value:.2f}")
+    plt.title("Final Portfolio Values")
+    plt.xlabel("Value ($)")
+    plt.ylabel("Count")
+    plt.legend()
+    plt.savefig("final_values_distribution.png", dpi=300, bbox_inches="tight")
     plt.close()
 
     return agent
@@ -618,7 +417,19 @@ def run_live_trading():
         logger.error("Failed to load model weights. Please train the model first.")
         return
 
-    # Create trading system
+    # Connect Alpaca lazily here
+    global trading_client, stock_data_client
+    if trading_client is None or stock_data_client is None:
+        try:
+            trading_client = TradingClient(
+                ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=ALPACA_PAPER_TRADING
+            )
+            stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+            logger.info("Successfully connected to Alpaca API for live trading")
+        except Exception as e:
+            logger.error(f"Failed to connect to Alpaca API: {e}")
+            return
+
     trading_system = AlpacaTradingSystem(agent, STOCK_SYMBOLS, trading_client, stock_data_client)
 
     # Invalidate cache at the start to ensure fresh data
@@ -748,9 +559,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["train", "test", "live", "optimize"],
+        choices=["train", "test", "live"],
         default="train",
-        help="Operation mode: train, test, live trading, or hyperparameter optimization",
+        help="Operation mode: train, test, or live trading",
     )
     parser.add_argument("--api_key", type=str, help="Alpaca API Key")
     parser.add_argument("--api_secret", type=str, help="Alpaca API Secret Key")
@@ -816,9 +627,7 @@ if __name__ == "__main__":
         elif args.mode == "live":
             logger.info("Starting live trading...")
             run_live_trading()
-        elif args.mode == "optimize":
-            logger.info("Starting hyperparameter optimization...")
-            optimize_agent()
+        # optimize and train_fast removed for simplicity; use unified training
     except KeyboardInterrupt:
         logger.info("Operation interrupted by user.")
     except Exception as e:
