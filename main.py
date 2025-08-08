@@ -295,6 +295,71 @@ def train_agent():
 # Removed fast training - unified into main train_agent
 
 
+def optimize_agent(trials=20):
+    """Run hyperparameter optimization using Optuna"""
+    try:
+        import optuna
+        import json
+        logger.info(f"Starting hyperparameter optimization with {trials} trials")
+        
+        def objective(trial):
+            # Suggest hyperparameters
+            learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+            batch_size = trial.suggest_categorical("batch_size", [256, 512, 1024])
+            gamma = trial.suggest_float("gamma", 0.9, 0.99)
+            noise_sigma = trial.suggest_float("noise_sigma", 0.05, 0.3)
+            
+            # Create environment and agent with suggested params
+            env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, 
+                                        stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR)
+            
+            agent = DRLAgent(env.state_size, len(env.symbols), learning_rate=learning_rate, 
+                           gamma=gamma, memory_size=10000, noise_sigma=noise_sigma, noise_theta=0.15)
+            
+            # Quick training and evaluation
+            total_reward = 0
+            for episode in range(10):  # Quick evaluation
+                state = env.reset()
+                episode_reward = 0
+                for step in range(100):  # Short episodes
+                    action = agent.act(state)
+                    next_state, reward, done, _ = env.step(action)
+                    agent.remember(state, action, reward, next_state, done)
+                    state = next_state
+                    episode_reward += reward
+                    if done:
+                        break
+                total_reward += episode_reward
+                
+                if len(agent.memory) >= batch_size:
+                    dataset = agent.memory.as_dataset(batch_size)
+                    agent.train(dataset)
+            
+            return total_reward / 10  # Average reward
+        
+        # Create study and optimize
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=trials)
+        
+        logger.info(f"Best trial: {study.best_trial.value}")
+        logger.info(f"Best params: {study.best_trial.params}")
+        
+        # Save best parameters
+        best_params = study.best_trial.params
+        with open("best_params.json", "w") as f:
+            json.dump(best_params, f, indent=2)
+        
+        logger.info("Optimization completed successfully")
+        return best_params
+        
+    except ImportError:
+        logger.error("Optuna not installed. Install with: pip install optuna")
+        return None
+    except Exception as e:
+        logger.error(f"Optimization failed: {e}")
+        return None
+
+
 def test_agent(agent=None, episodes=None):
     """Tests the trained agent.
 
@@ -559,9 +624,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["train", "test", "live"],
+        choices=["train", "test", "live", "optimize"],
         default="train",
-        help="Operation mode: train, test, or live trading",
+        help="Operation mode: train, test, live trading, or optimize",
     )
     parser.add_argument("--api_key", type=str, help="Alpaca API Key")
     parser.add_argument("--api_secret", type=str, help="Alpaca API Secret Key")
@@ -627,7 +692,10 @@ if __name__ == "__main__":
         elif args.mode == "live":
             logger.info("Starting live trading...")
             run_live_trading()
-        # optimize and train_fast removed for simplicity; use unified training
+        elif args.mode == "optimize":
+            logger.info("Starting hyperparameter optimization...")
+            optimize_agent(args.trials)
+        # train_fast removed for simplicity; use unified training
     except KeyboardInterrupt:
         logger.info("Operation interrupted by user.")
     except Exception as e:

@@ -58,15 +58,14 @@ STOCK_SYMBOLS = [
     "SPY",
     "TSLA",
     "NVDA",
-    "INTC",
     "AMD",
 ]
 INITIAL_BALANCE = 1000.0
 LOOKBACK_WINDOW = 168
 TRADING_FREQUENCY = "hourly"
 MAX_SHARES_PER_TRADE = 5
-TRAINING_EPISODES = 500  # Reduced from 1000 for faster training
-TEST_EPISODES = 50  # Reduced from 100 for faster testing
+TRAINING_EPISODES = 500
+TEST_EPISODES = 50
 REWARD_SCALING_FACTOR = 0.1  # Reduced to prevent unrealistic rewards and stabilize training
 
 if os.path.exists("stocks.json"):
