@@ -556,13 +556,13 @@ class StockTradingEnvironment:
                 logger.info(f"    Old Balance: ${float(self.balance_tensor.numpy()):.2f}")
                 logger.info(f"    New Balance: ${float(new_balance.numpy()):.2f}")
                 
-                # Verify no negative costs
+                # Log if we have net gains from selling (negative cost = money gained)
                 net_cost = tf.reduce_sum(final_trade_costs)
                 if net_cost < 0:
-                    logger.error(f"    ERROR: Negative net cost detected! This should not happen!")
-                    logger.error(f"    Trade amounts: {final_trade_amounts.numpy()}")
-                    logger.error(f"    Shares before: {self.shares_tensor.numpy()}")
-                    logger.error(f"    Prices: {current_prices.numpy()}")
+                    logger.info(f"    PROFIT: Net gain from selling: ${float(-net_cost):.2f}")
+                    sells = tf.reduce_sum(tf.minimum(final_trade_costs, 0))  # Sum of sell proceeds
+                    buys = tf.reduce_sum(tf.maximum(final_trade_costs, 0))   # Sum of buy costs
+                    logger.info(f"    Breakdown: Sells=${float(-sells):.2f}, Buys=${float(buys):.2f}")
             
             # Return updated values
             return new_balance, new_shares
