@@ -87,6 +87,19 @@ class StockTradingEnvironment:
         """
         self.balance = self.initial_balance
         
+        # Reset shares to zero for each episode
+        self.shares = {symbol: 0.0 for symbol in self.symbols}
+        if self.debug:
+            logger.info(f"RESET: Shares reset to zero: {self.shares}")
+        
+        # Reset GPU tensors to match CPU values
+        if self.device == '/GPU:0':
+            with tf.device(self.device):
+                self.balance_tensor = tf.constant(self.initial_balance, dtype=tf.float32)
+                self.shares_tensor = tf.zeros(len(self.symbols), dtype=tf.float32)
+                if self.debug:
+                    logger.info(f"RESET: GPU tensors reset - Balance: {self.balance_tensor.numpy()}, Shares: {self.shares_tensor.numpy()}")
+        
         # Ensure balance is properly reset and reasonable
         if not np.isfinite(self.balance) or self.balance <= 0:
             logger.warning(f"Invalid initial balance detected: ${float(self.balance):.2f}, resetting to ${self.initial_balance:.2f}")
@@ -124,7 +137,10 @@ class StockTradingEnvironment:
         self.portfolio_value_history = [self.initial_balance]
         self.done = False
         
-        logger.info(f"Environment reset complete. Current step: {self.current_step}, Data length: {len(self.data[self.symbols[0]])}")
+        if self.symbols and self.symbols[0] in self.data:
+            logger.info(f"Environment reset complete. Current step: {self.current_step}, Data length: {len(self.data[self.symbols[0]])}")
+        else:
+            logger.info(f"Environment reset complete. Current step: {self.current_step}, No valid data available")
         
         return self._get_state()
 
@@ -381,6 +397,8 @@ class StockTradingEnvironment:
                 self.shares = {symbol: float(shares_tensor[i].numpy()) for i, symbol in enumerate(self.symbols)}
                 self.balance_tensor = balance_tensor
                 self.shares_tensor = shares_tensor
+                if self.debug:
+                    logger.info(f"GPU TRADING: Updated balance to ${self.balance:.2f}, shares: {self.shares}")
                 # Ensure GPU tensors are in sync
                 with tf.device(self.device):
                     self.balance_tensor = tf.constant(self.balance, dtype=tf.float32)
@@ -406,7 +424,10 @@ class StockTradingEnvironment:
         self.current_step += 1
 
         # Check if episode is done
-        done = self.current_step >= len(self.data[self.symbols[0]]) - 1
+        if self.symbols and self.symbols[0] in self.data:
+            done = self.current_step >= len(self.data[self.symbols[0]]) - 1
+        else:
+            done = True  # End episode if no valid data
 
         # Calculate reward - only give reward at the end of episode
         if done:
@@ -478,27 +499,68 @@ class StockTradingEnvironment:
             max_trade_amount = 10.0  # Maximum shares per trade
             trade_amounts = tf.clip_by_value(trade_amounts, -max_trade_amount, max_trade_amount)
             
+            # FIRST: Prevent selling more shares than we own (apply share protection BEFORE any other calculations)
+            max_sellable = self.shares_tensor  # Can't sell more than we own
+            trade_amounts = tf.where(
+                trade_amounts < 0,  # For sells
+                tf.maximum(trade_amounts, -max_sellable),  # Limit sells to available shares
+                trade_amounts  # Keep buys unchanged
+            )
+            
             # Don't allow buying if balance is zero (tensor-safe)
             balance_nonpos = tf.less_equal(self.balance_tensor, 0.0)
             trade_amounts = tf.where(balance_nonpos, tf.minimum(trade_amounts, 0.0), trade_amounts)
             
-            # Calculate trade costs
+            # Calculate trade costs (now with share-protected amounts)
             trade_costs = trade_amounts * current_prices
+            
+            # DEBUG: Log detailed GPU trading calculations
+            if hasattr(self, 'debug') and self.debug:
+                logger.info(f"GPU TRADE DEBUG:")
+                logger.info(f"  Initial Balance: ${float(self.balance_tensor.numpy()):.2f}")
+                logger.info(f"  Action: {action}")
+                logger.info(f"  Trade Amounts: {trade_amounts.numpy()}")
+                logger.info(f"  Current Prices: {current_prices.numpy()}")
+                logger.info(f"  Trade Costs: {trade_costs.numpy()}")
+                logger.info(f"  Total Cost (buys only): ${float(tf.reduce_sum(tf.maximum(trade_costs, 0)).numpy()):.2f}")
             
             # Check if we have enough balance for purchases
-            total_cost = tf.reduce_sum(tf.maximum(trade_costs, 0))  # Only positive costs (buys)
+            buy_costs = tf.maximum(trade_costs, 0)  # Only positive costs (buys)
+            total_buy_cost = tf.reduce_sum(buy_costs)
             
-            # If we don't have enough balance, scale down purchases (tensor-safe)
-            need_scale = tf.greater(total_cost, self.balance_tensor)
-            safe_scale = tf.where(need_scale, self.balance_tensor / (total_cost + 1e-8), 1.0)
-            trade_amounts = tf.where(trade_amounts > 0, trade_amounts * safe_scale, trade_amounts)
-            trade_costs = trade_amounts * current_prices
+            # If we don't have enough balance, scale down ONLY the purchases
+            need_scale = tf.greater(total_buy_cost, self.balance_tensor)
+            safe_scale = tf.where(need_scale, self.balance_tensor / (total_buy_cost + 1e-8), 1.0)
             
-            # Update and clamp balance
-            new_balance = tf.maximum(self.balance_tensor - tf.reduce_sum(trade_costs), 0.0)
+            # Scale down only the buy amounts, keep sell amounts unchanged (sells are already protected)
+            final_trade_amounts = tf.where(trade_amounts > 0, trade_amounts * safe_scale, trade_amounts)
+            final_trade_costs = final_trade_amounts * current_prices
             
-            # Update and clamp shares (no shorting)
-            new_shares = tf.maximum(self.shares_tensor + trade_amounts, 0.0)
+            # Calculate new balance - now net cost should NEVER be negative since we can't sell what we don't have
+            new_balance = tf.maximum(self.balance_tensor - tf.reduce_sum(final_trade_costs), 0.0)
+            
+            # Update shares
+            new_shares = tf.maximum(self.shares_tensor + final_trade_amounts, 0.0)
+            
+            # DEBUG: Log final calculations
+            if hasattr(self, 'debug') and self.debug:
+                logger.info(f"  Final Calculations:")
+                logger.info(f"    Need Scale: {need_scale.numpy()}")
+                logger.info(f"    Scale Factor: {float(safe_scale.numpy()):.4f}")
+                logger.info(f"    Available Shares: {self.shares_tensor.numpy()}")
+                logger.info(f"    Final Trade Amounts: {final_trade_amounts.numpy()}")
+                logger.info(f"    Final Trade Costs: {final_trade_costs.numpy()}")
+                logger.info(f"    Net Cost: ${float(tf.reduce_sum(final_trade_costs).numpy()):.2f}")
+                logger.info(f"    Old Balance: ${float(self.balance_tensor.numpy()):.2f}")
+                logger.info(f"    New Balance: ${float(new_balance.numpy()):.2f}")
+                
+                # Verify no negative costs
+                net_cost = tf.reduce_sum(final_trade_costs)
+                if net_cost < 0:
+                    logger.error(f"    ERROR: Negative net cost detected! This should not happen!")
+                    logger.error(f"    Trade amounts: {final_trade_amounts.numpy()}")
+                    logger.error(f"    Shares before: {self.shares_tensor.numpy()}")
+                    logger.error(f"    Prices: {current_prices.numpy()}")
             
             # Return updated values
             return new_balance, new_shares
@@ -527,21 +589,28 @@ class StockTradingEnvironment:
             if self.balance <= 0 and trade_amount > 0:
                 trade_amount = 0  # Can't buy without money
             
-            # Calculate trade cost
+            # Calculate trade cost with transaction fees
             trade_cost = trade_amount * current_price
+            # Add transaction fees (0.1% of trade value)
+            transaction_fee = abs(trade_cost) * 0.001
+            total_cost = trade_cost + transaction_fee
             
             # Check if we have enough balance for purchases
-            if trade_cost > 0 and trade_cost > self.balance:
+            if total_cost > 0 and total_cost > self.balance:
                 # Scale down the purchase
-                scale_factor = self.balance / trade_cost
+                scale_factor = self.balance / total_cost
                 trade_amount *= scale_factor
                 trade_cost = trade_amount * current_price
+                transaction_fee = abs(trade_cost) * 0.001
+                total_cost = trade_cost + transaction_fee
             
             # Execute the trade
             old_balance = self.balance
             old_shares = self.shares[symbol]
-            self.balance -= trade_cost
+            self.balance -= total_cost
             self.shares[symbol] += trade_amount
+            if self.debug:
+                logger.info(f"TRADE EXECUTED: {symbol} {trade_amount:+.2f} shares, Balance: ${old_balance:.2f} -> ${self.balance:.2f}, Shares: {old_shares:.2f} -> {self.shares[symbol]:.2f}")
             
             # Prevent negative balance and shares
             self.balance = max(self.balance, 0.0)
@@ -815,6 +884,14 @@ class StockTradingEnvironment:
         prefetched_data = {}
         for symbol in self.symbols:
             try:
+                # Check if symbol data exists
+                if symbol not in self.data:
+                    logger.warning(f"No data available for {symbol}, using dummy data")
+                    prefetched_data[symbol] = np.full(
+                        self.lookback_window + 1, 100.0, dtype=np.float32
+                    )
+                    continue
+                    
                 # Check for different possible column names
                 symbol_data = self.data[symbol]
                 close_column = None

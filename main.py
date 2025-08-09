@@ -166,6 +166,10 @@ def train_agent(debug=False):
             progress_bar_prefill.update(1)
     progress_bar_prefill.close()
     logger.info("Replay buffer pre-filled.")
+    
+    # Reset environment after prefill to ensure clean state for training
+    env.reset()
+    logger.info("Environment reset after prefill.")
 
     # Create persistent dataset iterator for better performance
     dataset = agent.memory.as_dataset(BATCH_SIZE)
@@ -198,6 +202,7 @@ def train_agent(debug=False):
 
     for episode in progress_bar:
         episode_start_time = time.time()
+        # Ensure environment is completely reset for each episode
         state = env.reset()
         total_reward = 0.0
         done = False
