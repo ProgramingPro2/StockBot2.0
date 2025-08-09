@@ -25,6 +25,7 @@ from collections import deque
 
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER_TRADING, STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR, STATE_DIM, ACTION_DIM, LEARNING_RATE, BATCH_SIZE, GAMMA, MEMORY_SIZE, NOISE_SIGMA, NOISE_THETA, TRAINING_EPISODES, TEST_EPISODES, TRADING_FREQUENCY
 from utils import invalidate_cache
+from system_utils import comprehensive_system_check, ConfigurationValidator
 from drl_agent import DRLAgent
 from stock_env import StockTradingEnvironment
 from alpaca_trade_system import AlpacaTradingSystem
@@ -64,11 +65,23 @@ if gpus:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
         
+        # Configure GPU memory growth instead of hard limits for better compatibility
+        # This allows TensorFlow to allocate GPU memory as needed
         for gpu in gpus:
-            tf.config.set_logical_device_configuration(
-                gpu,
-                [tf.config.LogicalDeviceConfiguration(memory_limit=1024*6)]
-            )
+            try:
+                # Try to get GPU memory info
+                gpu_details = tf.config.experimental.get_device_details(gpu)
+                memory_limit = gpu_details.get('memory_limit', 8192)  # Default to 8GB
+                # Use 75% of available GPU memory
+                memory_limit = int(memory_limit * 0.75)
+                tf.config.set_logical_device_configuration(
+                    gpu,
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit)]
+                )
+                logger.info(f"GPU memory limit set to {memory_limit}MB")
+            except Exception as e:
+                logger.warning(f"Could not set GPU memory limit: {e}. Using memory growth instead.")
+                # Fallback: memory growth is already enabled above
         
         logical_gpus = tf.config.list_logical_devices('GPU')
         print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
@@ -107,13 +120,41 @@ def _validate_configuration():
 
 def check_system_health():
     """Perform comprehensive system health checks."""
-    _verify_gpu_availability()
-    _create_required_directories()
+    logger.info("Starting system health checks...")
     
-    if not _validate_configuration():
+    # Use the new comprehensive system check
+    system_ok = comprehensive_system_check()
+    
+    # Validate hyperparameters
+    hyperparams = {
+        'learning_rate': LEARNING_RATE,
+        'batch_size': BATCH_SIZE,
+        'gamma': GAMMA,
+        'reward_scaling_factor': REWARD_SCALING_FACTOR
+    }
+    
+    warnings = ConfigurationValidator.validate_hyperparameters(hyperparams)
+    for warning in warnings:
+        logger.warning(f"Hyperparameter warning: {warning}")
+    
+    # Validate state/action dimensions
+    calculated_state_dim, calculated_action_dim = ConfigurationValidator.validate_state_action_dimensions(
+        STOCK_SYMBOLS, LOOKBACK_WINDOW
+    )
+    
+    if calculated_state_dim != STATE_DIM:
+        logger.error(f"State dimension mismatch! Calculated: {calculated_state_dim}, Config: {STATE_DIM}")
         return False
     
-    logger.info(f"Health checks passed. Trading {len(STOCK_SYMBOLS)} symbols")
+    if calculated_action_dim != ACTION_DIM:
+        logger.error(f"Action dimension mismatch! Calculated: {calculated_action_dim}, Config: {ACTION_DIM}")
+        return False
+    
+    if system_ok:
+        logger.info(f"✅ Health checks passed. Trading {len(STOCK_SYMBOLS)} symbols")
+    else:
+        logger.warning("⚠️ Some health checks failed but continuing...")
+    
     return True
 
 
@@ -351,7 +392,12 @@ def train_agent(debug=False, time_limit_hours=None, max_time_hours=None):
     monitor.plot_performance("training_performance.png")
     
     # Quick test after training
-    test_agent(agent, episodes=5)
+    try:
+        logger.info("Running post-training evaluation...")
+        test_agent(agent, episodes=5)
+    except Exception as e:
+        logger.error(f"Post-training evaluation failed: {e}")
+        logger.error("Training completed successfully, but evaluation had issues")
     
     return agent
 

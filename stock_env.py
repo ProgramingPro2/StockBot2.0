@@ -931,8 +931,8 @@ class StockTradingEnvironment:
                     
                     # Handle any NaN values
                     if np.any(np.isnan(close_prices)):
-                        # Replace NaN with forward fill, then backward fill
-                        close_prices = pd.Series(close_prices).fillna(method='ffill').fillna(method='bfill').values
+                        # Replace NaN with forward fill, then backward fill (using newer pandas syntax)
+                        close_prices = pd.Series(close_prices).ffill().bfill().values
                         close_prices = np.asarray(close_prices, dtype=np.float32)
                     
                     # Ensure we have enough data

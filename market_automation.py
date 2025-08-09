@@ -576,9 +576,13 @@ class MarketAutomation:
 
 def setup_startup_script():
     """Create startup script for system boot"""
-    startup_script = """#!/bin/bash
+    # Use dynamic paths instead of hardcoded ones
+    current_dir = script_dir
+    username = os.getenv('USER', 'user')
+    
+    startup_script = f"""#!/bin/bash
 # Market Automation Startup Script
-cd /home/jpearce/Documents/Python/StockBot2-Experimental
+cd {current_dir}
 source .venv/bin/activate
 python3 market_automation.py >> market_automation.log 2>&1 &
 echo $! > market_automation.pid
@@ -598,9 +602,9 @@ After=network.target
 
 [Service]
 Type=simple
-User={os.getenv('USER', 'jpearce')}
-WorkingDirectory=/home/jpearce/Documents/Python/StockBot2-Experimental
-ExecStart=/home/jpearce/Documents/Python/StockBot2-Experimental/start_market_automation.sh
+User={username}
+WorkingDirectory={current_dir}
+ExecStart={current_dir}/start_market_automation.sh
 Restart=always
 RestartSec=10
 

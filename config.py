@@ -18,26 +18,43 @@ def validate_config():
     Validates configuration values. API keys are optional unless running live trading.
     """
     errors = []
+    warnings = []
 
     # API credentials are optional for training/testing (yfinance path). Warn if missing.
     if not ALPACA_API_KEY:
-        logger.warning("ALPACA_API_KEY not set. This is required only for live trading or Alpaca data.")
+        warnings.append("ALPACA_API_KEY not set. This is required only for live trading or Alpaca data.")
     if not ALPACA_SECRET_KEY:
-        logger.warning("ALPACA_SECRET_KEY not set. This is required only for live trading or Alpaca data.")
+        warnings.append("ALPACA_SECRET_KEY not set. This is required only for live trading or Alpaca data.")
 
     # Check stock symbols
     if not STOCK_SYMBOLS:
         errors.append("No stock symbols configured")
     elif len(STOCK_SYMBOLS) == 0:
         errors.append("Stock symbols list is empty")
+    elif len(STOCK_SYMBOLS) > 20:
+        warnings.append(f"Large number of symbols ({len(STOCK_SYMBOLS)}) may impact performance")
 
     # Check other critical parameters
     if INITIAL_BALANCE <= 0:
         errors.append("Initial balance must be positive")
     if LOOKBACK_WINDOW <= 0:
         errors.append("Lookback window must be positive")
+    elif LOOKBACK_WINDOW > 500:
+        warnings.append(f"Large lookback window ({LOOKBACK_WINDOW}) may impact memory usage")
     if MAX_SHARES_PER_TRADE <= 0:
         errors.append("Max shares per trade must be positive")
+    
+    # Check hyperparameters for reasonable ranges
+    if LEARNING_RATE <= 0 or LEARNING_RATE > 1:
+        errors.append(f"Learning rate ({LEARNING_RATE}) should be between 0 and 1")
+    if BATCH_SIZE <= 0 or BATCH_SIZE > 2048:
+        warnings.append(f"Unusual batch size ({BATCH_SIZE}), consider values between 32-1024")
+    if REWARD_SCALING_FACTOR < 0.001 or REWARD_SCALING_FACTOR > 1.0:
+        warnings.append(f"Reward scaling factor ({REWARD_SCALING_FACTOR}) may cause training issues")
+
+    # Log warnings
+    for warning in warnings:
+        logger.warning(warning)
 
     if errors:
         error_msg = "Configuration validation failed:\n" + "\n".join(f"- {error}" for error in errors)
@@ -47,6 +64,7 @@ def validate_config():
     logger.info("Configuration validation passed")
     logger.info(f"Trading {len(STOCK_SYMBOLS)} symbols with ${INITIAL_BALANCE} initial balance")
     logger.info(f"Paper trading enabled: {ALPACA_PAPER_TRADING}")
+    logger.info(f"State dimension: {STATE_DIM}, Action dimension: {ACTION_DIM}")
 
 # Configuration parameters
 STOCK_SYMBOLS = [
@@ -85,6 +103,11 @@ if os.path.exists("stocks.json"):
             logger.error(f"Error loading stock symbols from stocks.json: {e}")
 
 
+# State dimension calculation:
+# - Current prices for each symbol: len(STOCK_SYMBOLS)  
+# - Current shares for each symbol: len(STOCK_SYMBOLS)
+# - Current balance: 1
+# - Price history for each symbol: len(STOCK_SYMBOLS) * LOOKBACK_WINDOW
 STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)
 ACTION_DIM = len(STOCK_SYMBOLS)
 LEARNING_RATE = 0.0001
