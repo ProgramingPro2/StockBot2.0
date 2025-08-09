@@ -1,0 +1,14 @@
+[Unit]
+Description=StockBot2 Market Automation
+After=network.target
+
+[Service]
+Type=simple
+User=jpearce
+WorkingDirectory=/home/jpearce/Documents/Python/StockBot2-Experimental
+ExecStart=/home/jpearce/Documents/Python/StockBot2-Experimental/start_market_automation.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

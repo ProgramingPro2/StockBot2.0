@@ -127,5 +127,54 @@ CACHE_DIR.mkdir(exist_ok=True)
 # Data source configuration
 USE_YFINANCE = True
 
+# ===== AUTOMATION CONFIGURATION =====
+# Weekend training parameters optimized for 65.5 hour window
+AUTOMATION_CONFIG = {
+    # Training configuration
+    "training_epochs": 300,  # Balanced: good learning, fits timeframe
+    "training_sessions": 8,   # Multiple sessions for better convergence
+    "optimization_trials": 50, # Sufficient for hyperparameter tuning
+    
+    # Market automation settings
+    "live_trading_enabled": True,
+    "auto_restart": True,
+    "check_interval": 60,  # seconds
+    "weekend_intensive_training": True,
+    
+    # Timing estimates (based on 40s/episode, 8min/trial)
+    "training_schedule": {
+        "friday_after_close": {
+            "optimization_trials": 50,
+            "estimated_time_hours": 6.7  # 50 trials × 8min
+        },
+        "weekend_training": {
+            "episodes_per_session": 300,
+            "sessions": 8,
+            "estimated_time_per_session_hours": 3.3,  # 300 × 40s
+            "total_estimated_hours": 26.4  # 8 × 3.3h
+        },
+        "total_weekend_usage_hours": 33.1,  # 6.7 + 26.4
+        "available_weekend_hours": 65.5,
+        "safety_margin_hours": 32.4,  # 49% buffer
+        "completion_target": "Sunday evening"
+    },
+    
+    # Performance targets and limits
+    "performance_targets": {
+        "max_episode_time_seconds": 45,
+        "max_training_session_hours": 4,
+        "max_optimization_hours": 8,
+        "target_weekend_utilization": 0.5  # Use 50% of available time
+    },
+    
+    # Health monitoring thresholds
+    "health_checks": {
+        "min_disk_space_gb": 1.0,
+        "min_memory_gb": 2.0,
+        "max_cpu_usage_percent": 90,
+        "max_gpu_memory_percent": 95
+    }
+}
+
 # Validate configuration after all parameters are loaded
 validate_config()
