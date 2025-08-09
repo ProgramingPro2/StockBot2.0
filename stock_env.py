@@ -529,8 +529,10 @@ class StockTradingEnvironment:
             total_buy_cost = tf.reduce_sum(buy_costs)
             
             # If we don't have enough balance, scale down ONLY the purchases
-            need_scale = tf.greater(total_buy_cost, self.balance_tensor)
-            safe_scale = tf.where(need_scale, self.balance_tensor / (total_buy_cost + 1e-8), 1.0)
+            # Use only 90% of balance to leave some cash for future trades
+            available_for_trades = self.balance_tensor * 0.9
+            need_scale = tf.greater(total_buy_cost, available_for_trades)
+            safe_scale = tf.where(need_scale, available_for_trades / (total_buy_cost + 1e-8), 1.0)
             
             # Scale down only the buy amounts, keep sell amounts unchanged (sells are already protected)
             final_trade_amounts = tf.where(trade_amounts > 0, trade_amounts * safe_scale, trade_amounts)
