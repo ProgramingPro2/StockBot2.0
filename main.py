@@ -103,19 +103,33 @@ tf.config.run_functions_eagerly(False)
 # Load environment variables
 dotenv.load_dotenv()
 
-def check_system_health():
-    """Basic system health checks."""
+def _verify_gpu_availability():
+    """Check and log GPU availability."""
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:
         logger.info(f"GPU detected: {len(gpus)} physical GPU(s)")
     else:
         logger.warning("No GPU detected. Training will be slower on CPU")
-    
-    for dir_path in ["./models", "./data_cache", "./checkpoints"]:
-        Path(dir_path).mkdir(exist_ok=True)
-    
+
+def _create_required_directories():
+    """Create necessary directories if they don't exist."""
+    required_directories = ["./models", "./data_cache", "./checkpoints"]
+    for directory_path in required_directories:
+        Path(directory_path).mkdir(exist_ok=True)
+
+def _validate_configuration():
+    """Validate that required configuration is present."""
     if not STOCK_SYMBOLS:
         logger.error("No stock symbols configured")
+        return False
+    return True
+
+def check_system_health():
+    """Perform comprehensive system health checks."""
+    _verify_gpu_availability()
+    _create_required_directories()
+    
+    if not _validate_configuration():
         return False
     
     logger.info(f"Health checks passed. Trading {len(STOCK_SYMBOLS)} symbols")
@@ -129,171 +143,206 @@ stock_data_client = None
 # Removed optimization function - use unified training instead
 
 
+def _initialize_training_environment(debug=False):
+    """Initialize and return training environment and agent."""
+    invalidate_cache(days=0)
+    StockTradingEnvironment.clear_in_memory_cache()
+    
+    environment = StockTradingEnvironment(
+        STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, 
+        stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, 
+        REWARD_SCALING_FACTOR, debug=debug
+    )
+    
+    agent = DRLAgent(
+        STATE_DIM, ACTION_DIM, LEARNING_RATE, GAMMA, MEMORY_SIZE,
+        noise_sigma=NOISE_SIGMA, noise_theta=NOISE_THETA
+    )
+    
+    return environment, agent
+
+def _prefill_replay_buffer(agent, environment):
+    """Pre-fill the replay buffer with initial experiences."""
+    prefill_size = min(BATCH_SIZE, 2048)
+    logger.info(f"Pre-filling replay buffer with {prefill_size} experiences...")
+    
+    progress_bar = tqdm(total=prefill_size, desc="Pre-filling Buffer")
+    
+    while len(agent.memory) < prefill_size:
+        state = environment.reset()
+        done = False
+        
+        while not done and len(agent.memory) < prefill_size:
+            action = agent.act(state, explore=True)
+            next_state, reward, done, _ = environment.step(action)
+            agent.remember(state, action, reward, next_state, done)
+            state = next_state
+            progress_bar.update(1)
+    
+    progress_bar.close()
+    logger.info("Replay buffer pre-filled.")
+    environment.reset()
+    logger.info("Environment reset after prefill.")
+
+def _create_dataset_iterator(agent):
+    """Create and return dataset iterator for training."""
+    dataset = agent.memory.as_dataset(BATCH_SIZE)
+    if dataset:
+        return iter(dataset)
+    else:
+        logger.error("Failed to create dataset iterator")
+        return None
+
+def _run_training_episode(agent, environment, dataset_iterator, training_params):
+    """Execute a single training episode and return results."""
+    state = environment.reset()
+    total_reward = 0.0
+    done = False
+    episode_losses = []
+    
+    # Collect experiences for this episode
+    while not done:
+        action = agent.act(state)
+        next_state, reward, done, info = environment.step(action)
+        agent.remember(state, action, reward, next_state, done)
+        
+        state = next_state
+        total_reward += reward
+        training_params['steps_since_training'] += 1
+    
+    # Train agent if enough experiences collected
+    if len(agent.memory) >= BATCH_SIZE and training_params['steps_since_training'] >= training_params['frequency']:
+        for _ in range(4):  # Train multiple times per episode
+            losses = agent.train(dataset_iterator)
+            if losses:
+                episode_losses.append(losses)
+        training_params['steps_since_training'] = 0
+    
+    return total_reward, episode_losses, info
+
+def _calculate_episode_metrics(episode_losses):
+    """Calculate and return mean losses for the episode."""
+    if not episode_losses:
+        return None, None
+    
+    mean_actor_loss = np.mean([
+        float(loss["actor_loss"]) for loss in episode_losses 
+        if "actor_loss" in loss
+    ])
+    
+    mean_critic_loss = np.mean([
+        float(loss["critic_loss"]) for loss in episode_losses 
+        if "critic_loss" in loss
+    ])
+    
+    return mean_actor_loss, mean_critic_loss
+
+def _should_stop_early(episode, reward_history, best_reward, early_stopping_counter, warmup_episodes, patience):
+    """Check if early stopping criteria are met."""
+    if episode <= warmup_episodes:
+        return False, best_reward, early_stopping_counter
+    
+    current_avg_reward = np.mean(reward_history)
+    if current_avg_reward > best_reward:
+        return False, current_avg_reward, 0
+    else:
+        early_stopping_counter += 1
+        return early_stopping_counter >= patience, best_reward, early_stopping_counter
+
 def train_agent(debug=False):
-    """Unified training pipeline with monitoring, checkpointing, and testing."""
-    # Start performance monitoring
+    """Main training pipeline with monitoring, checkpointing, and testing."""
+    # Initialize monitoring and environment
     monitor = PerformanceMonitor(log_interval=10)
     monitor.start_monitoring()
     training_start_time = time.time()
     
     logger.info("Starting optimized training with performance monitoring...")
     
-    invalidate_cache(days=0)
-    StockTradingEnvironment.clear_in_memory_cache()
-    env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR, debug=debug)
-    agent = DRLAgent(
-        STATE_DIM,
-        ACTION_DIM,
-        LEARNING_RATE,
-        GAMMA,
-        MEMORY_SIZE,
-        noise_sigma=NOISE_SIGMA,
-        noise_theta=NOISE_THETA,
-    )
-
-    # Pre-fill replay buffer with more experiences for better initial training
-    prefill_size = min(BATCH_SIZE, 2048)  # Reasonable prefill
-    logger.info(f"Pre-filling replay buffer with {prefill_size} experiences...")
-    progress_bar_prefill = tqdm(total=prefill_size, desc="Pre-filling Buffer")
-    while len(agent.memory) < prefill_size:
-        state = env.reset()
-        done = False
-        while not done and len(agent.memory) < prefill_size:
-            action = agent.act(state, explore=True) # Use random actions
-            next_state, reward, done, _ = env.step(action)
-            agent.remember(state, action, reward, next_state, done)
-            state = next_state
-            progress_bar_prefill.update(1)
-    progress_bar_prefill.close()
-    logger.info("Replay buffer pre-filled.")
+    environment, agent = _initialize_training_environment(debug)
+    _prefill_replay_buffer(agent, environment)
+    dataset_iterator = _create_dataset_iterator(agent)
     
-    # Reset environment after prefill to ensure clean state for training
-    env.reset()
-    logger.info("Environment reset after prefill.")
-
-    # Create persistent dataset iterator for better performance
-    dataset = agent.memory.as_dataset(BATCH_SIZE)
-    if dataset:
-        dataset_iterator = iter(dataset)
-    else:
-        logger.error("Failed to create dataset iterator")
+    if not dataset_iterator:
         return agent
-
+    
+    # Training configuration
+    training_config = {
+        'checkpoint_interval': 25,
+        'early_stopping_patience': 8,
+        'warmup_episodes': 50,
+        'reward_history_size': 50
+    }
+    
+    training_params = {
+        'frequency': 1,
+        'steps_since_training': 0
+    }
+    
+    # Training state
     best_reward = -np.inf
-    checkpoint_interval = 25
-    early_stopping_patience = 8
     early_stopping_counter = 0
-    warmup_episodes = 50  # Reduced from 100 for faster warmup
-    reward_history = deque(maxlen=50)  # Reduced from 100 for faster adaptation
+    reward_history = deque(maxlen=training_config['reward_history_size'])
     
-    # Performance optimization: Pre-allocate arrays for batch processing
-    episode_states = []
-    episode_actions = []
-    episode_rewards = []
-    episode_next_states = []
-    episode_dones = []
-    
-    # Training frequency optimization
-    training_frequency = 1
-    steps_since_training = 0
-
-    # Create a progress bar for training
+    # Main training loop
     progress_bar = tqdm(range(TRAINING_EPISODES), desc="Training Progress")
-
+    
     for episode in progress_bar:
         episode_start_time = time.time()
-        # Ensure environment is completely reset for each episode
-        state = env.reset()
-        total_reward = 0.0
-        done = False
-        episode_losses = []
-        episode_data = []
-
-        # Collect experiences for this episode
-        while not done:
-            action = agent.act(state)
-            next_state, reward, done, info = env.step(action)
-
-            # Store experience for batch processing
-            episode_data.append((state, action, reward, next_state, done))
-            agent.remember(state, action, reward, next_state, done)
-
-            state = next_state
-            total_reward += reward
-            steps_since_training += 1
-
-        # Batch train on collected experiences for better efficiency
-        if len(agent.memory) >= BATCH_SIZE and steps_since_training >= training_frequency:
-            # Train multiple times per episode for better learning
-            for _ in range(4):
-                losses = agent.train(dataset_iterator)
-                if losses:
-                    episode_losses.append(losses)
-            steps_since_training = 0
-
-        # Calculate mean losses for this episode
-        if episode_losses:
-            mean_actor_loss = np.mean(
-                [float(loss["actor_loss"]) for loss in episode_losses if "actor_loss" in loss]
-            )
-            mean_critic_loss = np.mean(
-                [
-                    float(loss["critic_loss"])
-                    for loss in episode_losses
-                    if "critic_loss" in loss
-                ]
-            )
-            
-            # Get current performance metrics
+        
+        total_reward, episode_losses, info = _run_training_episode(
+            agent, environment, dataset_iterator, training_params
+        )
+        
+        # Calculate and display metrics
+        mean_actor_loss, mean_critic_loss = _calculate_episode_metrics(episode_losses)
+        
+        if mean_actor_loss is not None:
             current_metrics = monitor.get_current_metrics()
             gpu_usage = current_metrics['gpu_usage'] if current_metrics else 0
             episode_time = time.time() - episode_start_time
             
-            progress_bar.set_postfix(
-                {
-                    "reward": f"{total_reward:.6f}",
-                    "value": info["portfolio_value"],
-                    "actor_loss": f"{mean_actor_loss:.4f}",
-                    "critic_loss": f"{mean_critic_loss:.4f}",
-                    "gpu": f"{gpu_usage:.1f}%",
-                    "ep_time": f"{episode_time:.1f}s"
-                }
-            )
-
+            progress_bar.set_postfix({
+                "reward": f"{total_reward:.6f}",
+                "value": info["portfolio_value"],
+                "actor_loss": f"{mean_actor_loss:.4f}",
+                "critic_loss": f"{mean_critic_loss:.4f}",
+                "gpu": f"{gpu_usage:.1f}%",
+                "ep_time": f"{episode_time:.1f}s"
+            })
+        
         reward_history.append(total_reward)
-
-        # Save checkpoint periodically
-        if episode % checkpoint_interval == 0:
+        
+        # Checkpoint saving
+        if episode % training_config['checkpoint_interval'] == 0:
             agent.save_models()
-
-        # Save best model and check for early stopping
-        if episode > warmup_episodes:
-            current_avg_reward = np.mean(reward_history)
-            if current_avg_reward > best_reward:
-                best_reward = current_avg_reward
-                agent.save_models("./models")
-                early_stopping_counter = 0
-            else:
-                early_stopping_counter += 1
-
-            if early_stopping_counter >= early_stopping_patience:
-                logger.info(f"Early stopping triggered after {episode} episodes.")
-                break
-
-    # Stop monitoring and print summary
+        
+        # Early stopping check
+        should_stop, best_reward, early_stopping_counter = _should_stop_early(
+            episode, reward_history, best_reward, early_stopping_counter,
+            training_config['warmup_episodes'], training_config['early_stopping_patience']
+        )
+        
+        if should_stop:
+            logger.info(f"Early stopping triggered after {episode} episodes.")
+            break
+        
+        # Save best model
+        if best_reward > -np.inf and np.mean(reward_history) == best_reward:
+            agent.save_models("./models")
+    
+    # Training completion
     monitor.stop_monitoring()
     total_training_time = time.time() - training_start_time
     
     logger.info(f"Training completed in {total_training_time:.1f} seconds")
     logger.info(f"Average time per episode: {total_training_time/TRAINING_EPISODES:.2f} seconds")
     
-    # Print performance summary
     monitor.print_summary()
     monitor.plot_performance("training_performance.png")
-
+    
     # Quick test after training
     test_agent(agent, episodes=5)
-
+    
     return agent
 
 
@@ -337,8 +386,14 @@ def optimize_agent(trials=20):
                 total_reward += episode_reward
                 
                 if len(agent.memory) >= batch_size:
-                    dataset = agent.memory.as_dataset(batch_size)
-                    agent.train(dataset)
+                    try:
+                        dataset = agent.memory.as_dataset(batch_size)
+                        if dataset:
+                            dataset_iterator = iter(dataset)
+                            agent.train(dataset_iterator)
+                    except Exception as e:
+                        logger.warning(f"Training error: {e}")
+                        # Continue without training for this step
             
             return total_reward / 10  # Average reward
         
