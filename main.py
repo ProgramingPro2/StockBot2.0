@@ -230,12 +230,21 @@ def _should_stop_early(episode, reward_history, best_reward, early_stopping_coun
         early_stopping_counter += 1
         return early_stopping_counter >= patience, best_reward, early_stopping_counter
 
-def train_agent(debug=False):
+def train_agent(debug=False, time_limit_hours=None, max_time_hours=None):
     """Main training pipeline with monitoring, checkpointing, and testing."""
     # Initialize monitoring and environment
     monitor = PerformanceMonitor(log_interval=10)
     monitor.start_monitoring()
     training_start_time = time.time()
+    
+    # Convert time limits to seconds
+    time_limit_seconds = time_limit_hours * 3600 if time_limit_hours else None
+    max_time_seconds = max_time_hours * 3600 if max_time_hours else None
+    
+    if time_limit_hours:
+        logger.info(f"Starting training with {time_limit_hours:.1f} hour time limit")
+    if max_time_hours:
+        logger.info(f"Maximum training time: {max_time_hours:.1f} hours (hard limit)")
     
     logger.info("Starting optimized training with performance monitoring...")
     
@@ -269,6 +278,21 @@ def train_agent(debug=False):
     
     for episode in progress_bar:
         episode_start_time = time.time()
+        current_time = time.time()
+        elapsed_time = current_time - training_start_time
+        
+        # Check hard time limit (stops immediately)
+        if max_time_seconds and elapsed_time >= max_time_seconds:
+            logger.info(f"Hard time limit reached ({max_time_hours:.1f}h). Stopping training.")
+            break
+        
+        # Check soft time limit (finish current episode then stop)
+        if time_limit_seconds and elapsed_time >= time_limit_seconds:
+            logger.info(f"Time limit reached ({time_limit_hours:.1f}h). Finishing current episode...")
+            # Continue with current episode but mark to stop after
+            time_limit_reached = True
+        else:
+            time_limit_reached = False
         
         total_reward, episode_losses, info = _run_training_episode(
             agent, environment, dataset_iterator, training_params
@@ -310,6 +334,11 @@ def train_agent(debug=False):
         # Save best model
         if best_reward > -np.inf and np.mean(reward_history) == best_reward:
             agent.save_models("./models")
+        
+        # Check if time limit was reached
+        if time_limit_reached:
+            logger.info(f"Training stopped after {episode + 1} episodes due to time limit.")
+            break
     
     # Training completion
     monitor.stop_monitoring()
@@ -330,12 +359,22 @@ def train_agent(debug=False):
 
 
 
-def optimize_agent(trials=20):
+def optimize_agent(trials=20, time_limit_hours=None, max_time_hours=None):
     """Run hyperparameter optimization using Optuna"""
     try:
         import optuna
         import json
-        logger.info(f"Starting hyperparameter optimization with {trials} trials")
+        
+        # Convert time limits to seconds
+        time_limit_seconds = time_limit_hours * 3600 if time_limit_hours else None
+        max_time_seconds = max_time_hours * 3600 if max_time_hours else None
+        
+        if time_limit_hours:
+            logger.info(f"Starting optimization with {trials} trials and {time_limit_hours:.1f}h time limit")
+        else:
+            logger.info(f"Starting hyperparameter optimization with {trials} trials")
+        
+        optimization_start_time = time.time()
         
         def objective(trial):
             # Suggest hyperparameters
@@ -354,6 +393,18 @@ def optimize_agent(trials=20):
             # Quick training and evaluation
             total_reward = 0
             for episode in range(10):  # Quick evaluation
+                # Check time limits during optimization
+                current_time = time.time()
+                elapsed_time = current_time - optimization_start_time
+                
+                if max_time_seconds and elapsed_time >= max_time_seconds:
+                    logger.info(f"Optimization hard time limit reached. Stopping trial early.")
+                    break
+                    
+                if time_limit_seconds and elapsed_time >= time_limit_seconds:
+                    logger.info(f"Optimization time limit reached. Finishing current trial.")
+                    break
+                
                 state = env.reset()
                 episode_reward = 0
                 for step in range(100):  # Short episodes
@@ -374,13 +425,17 @@ def optimize_agent(trials=20):
                             agent.train(dataset_iterator)
                     except Exception as e:
                         logger.warning(f"Training error: {e}")
-                        # Continue without training for this step
             
-            return total_reward / 10  # Average reward
+            return total_reward / max(1, episode + 1)  # Average reward over completed episodes
         
         # Create study and optimize
         study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=trials)
+        
+        # Use Optuna's built-in timeout if time limit is specified
+        if time_limit_seconds:
+            study.optimize(objective, n_trials=trials, timeout=time_limit_seconds)
+        else:
+            study.optimize(objective, n_trials=trials)
         
         logger.info(f"Best trial: {study.best_trial.value}")
         logger.info(f"Best params: {study.best_trial.params}")
@@ -401,15 +456,29 @@ def optimize_agent(trials=20):
         return None
 
 
-def test_agent(agent=None, episodes=None, debug=False):
+def test_agent(agent=None, episodes=None, debug=False, time_limit_hours=None, max_time_hours=None):
     """Tests the trained agent.
 
     Args:
         agent: The DRLAgent instance to test. If None, a new agent is initialized and models are loaded.
         episodes: Number of episodes to test. If None, uses TEST_EPISODES from config.
+        debug: Enable debug logging.
+        time_limit_hours: Soft time limit in hours.
+        max_time_hours: Hard time limit in hours.
     """
     if episodes is None:
         episodes = TEST_EPISODES
+    
+    # Convert time limits to seconds
+    time_limit_seconds = time_limit_hours * 3600 if time_limit_hours else None
+    max_time_seconds = max_time_hours * 3600 if max_time_hours else None
+    
+    test_start_time = time.time()
+    
+    if time_limit_hours:
+        logger.info(f"Starting testing with {time_limit_hours:.1f} hour time limit")
+    if max_time_hours:
+        logger.info(f"Maximum testing time: {max_time_hours:.1f} hours (hard limit)")
     if agent is None:
         agent = DRLAgent(
             STATE_DIM,
@@ -430,13 +499,28 @@ def test_agent(agent=None, episodes=None, debug=False):
     portfolio_values = []
 
     for episode in tqdm(range(episodes), desc="Testing Progress"):
+        current_time = time.time()
+        elapsed_time = current_time - test_start_time
+        
+        # Check hard time limit
+        if max_time_seconds and elapsed_time >= max_time_seconds:
+            logger.info(f"Hard time limit reached ({max_time_hours:.1f}h). Stopping testing.")
+            break
+            
+        # Check soft time limit
+        if time_limit_seconds and elapsed_time >= time_limit_seconds:
+            logger.info(f"Time limit reached ({time_limit_hours:.1f}h). Finishing current episode...")
+            time_limit_reached = True
+        else:
+            time_limit_reached = False
+        
         state = env.reset()
         total_reward = 0.0
         done = False
         episode_portfolio = [INITIAL_BALANCE]
 
         while not done:
-            action = agent.act(state, explore=False)  # No exploration during testing
+            action = agent.act(state, explore=False)
             next_state, reward, done, info = env.step(action)
 
             state = next_state
@@ -446,10 +530,15 @@ def test_agent(agent=None, episodes=None, debug=False):
         total_rewards.append(total_reward)
         portfolio_values.append(episode_portfolio)
 
-        if episode % 10 == 0:  # Print only every 10 episodes to reduce output
+        if episode % 10 == 0:
             logger.info(
                 f"Test Episode {episode + 1}/{episodes}, Final Reward: {total_reward:.6f}, Final Portfolio Value: {float(info['portfolio_value']):.2f}"
             )
+        
+        # Stop if time limit reached
+        if time_limit_reached:
+            logger.info(f"Testing stopped after {episode + 1} episodes due to time limit.")
+            break
 
     # Calculate statistics
     final_values = [portfolio[-1] for portfolio in portfolio_values]
@@ -691,6 +780,16 @@ if __name__ == "__main__":
         help="Number of trials for hyperparameter optimization",
     )
     parser.add_argument(
+        "--time-limit",
+        type=float,
+        help="Time limit in hours (alternative to episode/trial counts)",
+    )
+    parser.add_argument(
+        "--max-time",
+        type=float,
+        help="Maximum time in hours (safety limit, stops even mid-episode)",
+    )
+    parser.add_argument(
         "--gpu",
         action="store_true",
         help="Force GPU usage (will raise error if not available)",
@@ -724,19 +823,29 @@ if __name__ == "__main__":
         
         if args.mode == "train":
             logger.info("Training agent...")
-            logger.info(f"Number of epochs: {args.epochs}")
-            TRAINING_EPISODES = args.epochs
-            agent = train_agent(debug=args.debug)
+            if args.time_limit or args.max_time:
+                logger.info(f"Time limits: soft={args.time_limit}h, hard={args.max_time}h")
+            else:
+                logger.info(f"Number of epochs: {args.epochs}")
+                TRAINING_EPISODES = args.epochs
+            agent = train_agent(debug=args.debug, time_limit_hours=args.time_limit, max_time_hours=args.max_time)
         elif args.mode == "test":
             logger.info("Testing agent...")
-            logger.info(f"Number of test episodes: {args.episodes}")
-            test_agent(episodes=args.episodes, debug=args.debug)
+            if args.time_limit or args.max_time:
+                logger.info(f"Time limits: soft={args.time_limit}h, hard={args.max_time}h")
+            else:
+                logger.info(f"Number of test episodes: {args.episodes}")
+            test_agent(episodes=args.episodes, debug=args.debug, time_limit_hours=args.time_limit, max_time_hours=args.max_time)
         elif args.mode == "live":
             logger.info("Starting live trading...")
             run_live_trading()
         elif args.mode == "optimize":
             logger.info("Starting hyperparameter optimization...")
-            optimize_agent(args.trials)
+            if args.time_limit or args.max_time:
+                logger.info(f"Time limits: soft={args.time_limit}h, hard={args.max_time}h")
+            else:
+                logger.info(f"Number of trials: {args.trials}")
+            optimize_agent(args.trials, time_limit_hours=args.time_limit, max_time_hours=args.max_time)
         # train_fast removed for simplicity; use unified training
     except KeyboardInterrupt:
         logger.info("Operation interrupted by user.")

@@ -146,6 +146,35 @@ class MarketAutomation:
         now = datetime.now()
         return now.weekday() in [5, 6]  # Saturday = 5, Sunday = 6
     
+    def get_remaining_weekend_time(self):
+        """Calculate remaining weekend time until Monday market open"""
+        now = datetime.now()
+        
+        # Monday 9:30 AM
+        next_monday = now + timedelta(days=(7 - now.weekday()) % 7)
+        if next_monday.date() == now.date():  # If today is Monday
+            next_monday += timedelta(days=7)
+        
+        monday_market_open = next_monday.replace(hour=9, minute=30, second=0, microsecond=0)
+        
+        remaining_time = monday_market_open - now
+        remaining_hours = remaining_time.total_seconds() / 3600
+        
+        return max(0, remaining_hours)
+    
+    def should_use_time_based_training(self):
+        """Determine if time-based training should be used based on available time"""
+        if not self.config.get("use_time_based_training", False):
+            return False
+            
+        # Always use time-based training on weekends for better scheduling
+        if self.is_weekend():
+            remaining_hours = self.get_remaining_weekend_time()
+            logger.info(f"⏰ Weekend time remaining: {remaining_hours:.1f} hours until Monday market open")
+            return remaining_hours > 1.0  # Only if we have at least 1 hour left
+            
+        return True
+    
     def _health_check(self):
         """Perform health checks before starting processes"""
         try:
@@ -248,14 +277,27 @@ class MarketAutomation:
             venv_python = script_dir / ".venv" / "bin" / "python3"
             main_script = script_dir / "main.py"
             
-            self.optimization_process = subprocess.Popen([
-                str(venv_python), str(main_script), "--mode", "optimize", 
-                "--trials", str(self.config['optimization_trials'])
-            ], 
-            cwd=str(script_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=dict(os.environ, PYTHONUNBUFFERED="1")
+            cmd = [str(venv_python), str(main_script), "--mode", "optimize"]
+            
+            # Choose between time-based and trial-based optimization
+            if self.config.get("use_time_based_optimization", False):
+                friday_config = self.config.get("training_schedule", {}).get("friday_optimization", {})
+                time_limit = friday_config.get("time_limit_hours", 6)
+                max_time = friday_config.get("max_time_hours", 8)
+                
+                cmd.extend(["--time-limit", str(time_limit)])
+                cmd.extend(["--max-time", str(max_time)])
+                logger.info(f"🕐 Time-based optimization: {time_limit}h limit, {max_time}h maximum")
+            else:
+                cmd.extend(["--trials", str(self.config['optimization_trials'])])
+                logger.info(f"📊 Trial-based optimization: {self.config['optimization_trials']} trials")
+            
+            self.optimization_process = subprocess.Popen(
+                cmd, 
+                cwd=str(script_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=dict(os.environ, PYTHONUNBUFFERED="1")
             )
             logger.info(f"Optimization started with PID: {self.optimization_process.pid}")
         except Exception as e:
@@ -277,14 +319,25 @@ class MarketAutomation:
             venv_python = script_dir / ".venv" / "bin" / "python3"
             main_script = script_dir / "main.py"
             
-            self.training_process = subprocess.Popen([
-                str(venv_python), str(main_script), "--mode", "train", 
-                "--epochs", str(self.config['training_epochs'])
-            ], 
-            cwd=str(script_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=dict(os.environ, PYTHONUNBUFFERED="1")
+            cmd = [str(venv_python), str(main_script), "--mode", "train"]
+            
+            # Choose between time-based and episode-based training
+            if self.config.get("use_time_based_training", False):
+                max_training_time = self.config.get("performance_targets", {}).get("max_training_hours", 4)
+                
+                cmd.extend(["--time-limit", str(max_training_time)])
+                cmd.extend(["--max-time", str(max_training_time)])
+                logger.info(f"⏰ Time-based training: {max_training_time}h limit")
+            else:
+                cmd.extend(["--epochs", str(self.config['training_epochs'])])
+                logger.info(f"📈 Episode-based training: {self.config['training_epochs']} epochs")
+            
+            self.training_process = subprocess.Popen(
+                cmd, 
+                cwd=str(script_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=dict(os.environ, PYTHONUNBUFFERED="1")
             )
             logger.info(f"Training started with PID: {self.training_process.pid}")
         except Exception as e:
@@ -302,21 +355,38 @@ class MarketAutomation:
             return
         
         # Use weekend-specific training parameters
-        weekend_epochs = self.config.get("training_schedule", {}).get("weekend_training", {}).get("episodes_per_session", 300)
+        weekend_epochs = 300  # Default episodes for non-time-based training
         
         try:
             logger.info(f"Starting intensive weekend training with {weekend_epochs} episodes...")
             venv_python = script_dir / ".venv" / "bin" / "python3"
             main_script = script_dir / "main.py"
             
-            self.training_process = subprocess.Popen([
-                str(venv_python), str(main_script), "--mode", "train", 
-                "--epochs", str(weekend_epochs)
-            ], 
-            cwd=str(script_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=dict(os.environ, PYTHONUNBUFFERED="1")
+            cmd = [str(venv_python), str(main_script), "--mode", "train"]
+            
+            # Choose between time-based and episode-based weekend training
+            if self.config.get("use_time_based_training", False):
+                weekend_config = self.config.get("training_schedule", {}).get("weekend_training", {})
+                time_limit = weekend_config.get("time_limit_hours", 3)
+                max_time = weekend_config.get("max_time_hours", 4)
+                
+                cmd.extend(["--time-limit", str(time_limit)])
+                cmd.extend(["--max-time", str(max_time)])
+                logger.info(f"🎯 Time-based weekend training: {time_limit}h limit, {max_time}h maximum")
+                
+                # Calculate and log expected completion time
+                completion_time = datetime.now() + timedelta(hours=time_limit)
+                logger.info(f"📅 Expected completion: {completion_time.strftime('%H:%M on %A')}")
+            else:
+                cmd.extend(["--epochs", str(weekend_epochs)])
+                logger.info(f"📊 Episode-based weekend training: {weekend_epochs} episodes")
+            
+            self.training_process = subprocess.Popen(
+                cmd, 
+                cwd=str(script_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=dict(os.environ, PYTHONUNBUFFERED="1")
             )
             logger.info(f"Weekend training started with PID: {self.training_process.pid}")
             
@@ -374,21 +444,48 @@ class MarketAutomation:
                 if not self.training_process or self.training_process.poll() is not None:
                     # Check if we should run intensive weekend training
                     if self.is_weekend() and self.config.get("weekend_intensive_training", False):
-                        logger.info("Weekend detected - starting intensive training session")
-                        self.run_weekend_training()
+                        remaining_time = self.get_remaining_weekend_time()
+                        
+                        if remaining_time > 2.0:  # Need at least 2 hours for meaningful training
+                            logger.info(f"🎯 Weekend training: {remaining_time:.1f}h available until Monday")
+                            self.run_weekend_training()
+                        else:
+                            logger.info(f"⚠️ Insufficient weekend time ({remaining_time:.1f}h). Skipping training.")
                     else:
                         logger.info("Market closed - starting regular training")
                         self.run_training()
     
     def status_report(self):
-        """Print current status"""
+        """Print current status with time-based information"""
         logger.info("=== Market Automation Status ===")
         logger.info(f"Market Status: {self.market_status}")
         logger.info(f"Market Open: {self.is_market_open()}")
-        logger.info(f"Live Trading: {'Running' if self.live_trading_process and self.live_trading_process.poll() is None else 'Stopped'}")
-        logger.info(f"Optimization: {'Running' if self.optimization_process and self.optimization_process.poll() is None else 'Stopped'}")
-        logger.info(f"Training: {'Running' if self.training_process and self.training_process.poll() is None else 'Stopped'}")
         logger.info(f"Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Time-based information
+        if self.is_weekend():
+            remaining_time = self.get_remaining_weekend_time()
+            logger.info(f"⏰ Weekend time remaining: {remaining_time:.1f}h until Monday 9:30 AM")
+        
+        # Process status with time-based indicators
+        live_status = 'Running' if self.live_trading_process and self.live_trading_process.poll() is None else 'Stopped'
+        opt_status = 'Running' if self.optimization_process and self.optimization_process.poll() is None else 'Stopped'
+        train_status = 'Running' if self.training_process and self.training_process.poll() is None else 'Stopped'
+        
+        logger.info(f"🔄 Live Trading: {live_status}")
+        logger.info(f"🎯 Optimization: {opt_status}")
+        logger.info(f"🎓 Training: {train_status}")
+        
+        # Training mode information
+        if self.config.get("use_time_based_training", False):
+            logger.info(f"⏱️ Training Mode: Time-based control enabled")
+        else:
+            logger.info(f"📊 Training Mode: Episode-based control")
+            
+        if self.config.get("use_time_based_optimization", False):
+            logger.info(f"🕐 Optimization Mode: Time-based control enabled")
+        else:
+            logger.info(f"📈 Optimization Mode: Trial-based control")
     
     def shutdown(self):
         """Graceful shutdown"""

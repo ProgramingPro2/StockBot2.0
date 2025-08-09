@@ -135,34 +135,41 @@ AUTOMATION_CONFIG = {
     "auto_restart": True,
     "check_interval": 60,
     "weekend_intensive_training": True,
+    
+    # Time-based automation controls
+    "use_time_based_training": True,
+    "use_time_based_optimization": True,
+    
+    # Simplified weekend schedule with practical time limits
     "training_schedule": {
-        "friday_after_close": {
-            "optimization_trials": 50,
-            "estimated_time_hours": 6.7
+        "friday_optimization": {
+            "time_limit_hours": 6,
+            "max_time_hours": 8
         },
         "weekend_training": {
-            "episodes_per_session": 300,
-            "sessions": 8,
-            "estimated_time_per_session_hours": 3.3,
-            "total_estimated_hours": 26.4
+            "time_limit_hours": 3,
+            "max_time_hours": 4,
+            "sessions": 6
         },
-        "total_weekend_usage_hours": 33.1,
-        "available_weekend_hours": 65.5,
-        "safety_margin_hours": 32.4,
-        "completion_target": "Sunday evening"
+        "total_weekend_hours": 24,
+        "available_weekend_hours": 64,
+        "utilization_target": 0.4
     },
     
+    # Performance and safety limits
     "performance_targets": {
-        "max_episode_time_seconds": 45,
-        "max_training_session_hours": 4,
+        "max_episode_time_seconds": 60,
+        "max_training_hours": 4,
         "max_optimization_hours": 8,
-        "target_weekend_utilization": 0.5
+        "weekend_utilization": 0.4
     },
+    
+    # System health thresholds
     "health_checks": {
-        "min_disk_space_gb": 1.0,
-        "min_memory_gb": 2.0,
-        "max_cpu_usage_percent": 90,
-        "max_gpu_memory_percent": 95
+        "min_disk_space_gb": 2.0,
+        "min_memory_gb": 4.0,
+        "max_cpu_usage_percent": 85,
+        "max_gpu_memory_percent": 90
     }
 }
 

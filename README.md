@@ -105,19 +105,56 @@ python3 market_automation.py
 
 ### Manual Operations
 
+#### Episode-Based Control (Traditional)
+
 ```bash
-# Training modes
-python3 main.py --mode train --epochs 100          # Train model
-python3 main.py --mode train --epochs 50 --debug   # Debug training
-python3 main.py --mode optimize --trials 20        # Hyperparameter optimization
+python3 main.py --mode train --epochs 100          # Train for 100 episodes
+python3 main.py --mode optimize --trials 20        # 20 optimization trials
+python3 main.py --mode test --episodes 10          # Test for 10 episodes
+```
 
-# Testing and evaluation
-python3 main.py --mode test --episodes 10          # Test trained model
-python3 main.py --mode test --episodes 5 --debug   # Debug testing
+#### Time-Based Control (New!)
 
-# Live trading (requires API setup)
+```bash
+python3 main.py --mode train --time-limit 2.0      # Train for 2 hours
+python3 main.py --mode optimize --time-limit 3.0   # Optimize for 3 hours
+python3 main.py --mode test --time-limit 0.5       # Test for 30 minutes
+
+# Advanced time controls
+python3 main.py --mode train --time-limit 1.5 --max-time 2.0  # Soft 1.5h, hard 2h limit
+python3 main.py --mode train --epochs 50 --debug             # Debug training
+```
+
+#### Live Trading
+
+```bash
 python3 main.py --mode live                        # Start live trading
 ```
+
+**Time Control Benefits:**
+
+- ✅ **Guaranteed completion** within time windows
+- ✅ **Perfect for automation** and scheduling
+- ✅ **Prevents overruns** in production environments
+- ✅ **Flexible control** with soft and hard limits
+
+#### Intelligent Automation (Enhanced!)
+
+The market automation system now features **intelligent time management**:
+
+```bash
+# Start the enhanced automation system
+python3 market_automation.py
+```
+
+**Smart Features:**
+
+- 🧠 **Intelligent Scheduling**: Automatically calculates remaining weekend time
+- ⏰ **Time-Based Decisions**: Uses time limits instead of episode counts when enabled
+- 🛡️ **Safety Buffers**: Adds 10% safety margins to prevent overruns
+- 📅 **Completion Prediction**: Logs expected completion times
+- 🎯 **Weekend Optimization**: Skips training if insufficient time remains
+- 📊 **Real-Time Monitoring**: Enhanced status reports with time information
 
 ### Market Automation System
 
@@ -148,11 +185,36 @@ The automation system provides hands-off operation with intelligent scheduling:
 
 ```python
 AUTOMATION_CONFIG = {
-    "training_epochs": 300,           # Episodes per training session
-    "training_sessions": 8,           # Weekend training sessions
-    "optimization_trials": 50,        # Friday optimization trials
-    "live_trading_enabled": True,     # Enable live trading
-    "weekend_intensive_training": True # Enhanced weekend training
+    # Basic automation settings
+    "training_epochs": 300,
+    "optimization_trials": 50,
+    "live_trading_enabled": True,
+    "weekend_intensive_training": True,
+
+    # Time-based automation controls
+    "use_time_based_training": True,
+    "use_time_based_optimization": True,
+
+    # Practical time limits (hours)
+    "training_schedule": {
+        "friday_optimization": {
+            "time_limit_hours": 6,        # Soft limit
+            "max_time_hours": 8           # Hard limit
+        },
+        "weekend_training": {
+            "time_limit_hours": 3,        # Per session
+            "max_time_hours": 4,          # Hard limit
+            "sessions": 6                 # Max sessions
+        }
+    },
+
+    # System safety thresholds
+    "health_checks": {
+        "min_disk_space_gb": 2.0,
+        "min_memory_gb": 4.0,
+        "max_cpu_usage_percent": 85,
+        "max_gpu_memory_percent": 90
+    }
 }
 ```
 
