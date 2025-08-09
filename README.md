@@ -161,7 +161,7 @@ AUTOMATION_CONFIG = {
 ```python
 # Core trading settings
 STOCK_SYMBOLS = ["AAPL", "GOOGL", "MSFT", "TSLA", "AMZN"]  # Loaded from stocks.json
-INITIAL_BALANCE = 10000.0          # Starting portfolio value
+INITIAL_BALANCE = 1000.0           # Starting portfolio value
 MAX_SHARES_PER_TRADE = 5           # Position size limit
 REWARD_SCALING_FACTOR = 0.01       # Learning reward scale
 
@@ -176,17 +176,19 @@ MEMORY_SIZE = 50000                # Experience replay buffer size
 ### Core Components
 
 ```
-StockBot2/
-├── 🎮 main.py                     # Main entry point and mode orchestration
-├── 🤖 drl_agent.py               # DDPG reinforcement learning agent
-├── 🌍 stock_env.py               # Trading environment simulation
-├── 💾 replay_buffer.py           # Experience replay memory management
-├── 📊 performance_monitor.py     # System performance tracking
-├── 🔄 market_automation.py       # Intelligent automation system
-├── 💰 alpaca_trade_system.py     # Live trading integration
-├── ⚙️ config.py                  # Configuration management
-├── 🛠️ utils.py                   # Utility functions
-└── 📈 noise.py                   # Exploration noise for training
+StockBot2.0/
+├── main.py                     # Main entry point and mode orchestration
+├── drl_agent.py               # DDPG reinforcement learning agent
+├── stock_env.py               # Trading environment simulation
+├── replay_buffer.py           # Experience replay memory management
+├── performance_monitor.py     # System performance tracking
+├── market_automation.py       # Intelligent automation system
+├── alpaca_trade_system.py     # Live trading integration
+├── config.py                  # Configuration management
+├── utils.py                   # Utility functions
+├── noise.py                   # Exploration noise for training
+├── install_service.sh         # Service installation script
+└── stocks.json                # Stock symbols configuration
 ```
 
 ### Data Flow

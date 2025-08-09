@@ -66,7 +66,7 @@ TRADING_FREQUENCY = "hourly"
 MAX_SHARES_PER_TRADE = 5
 TRAINING_EPISODES = 500
 TEST_EPISODES = 50
-REWARD_SCALING_FACTOR = 0.1  # Reduced to prevent unrealistic rewards and stabilize training
+REWARD_SCALING_FACTOR = 0.01
 
 if os.path.exists("stocks.json"):
     with open("stocks.json", "r") as f:
@@ -76,25 +76,23 @@ if os.path.exists("stocks.json"):
                 raise ValueError(
                     "Invalid format in stocks.json. Expected a list of stock symbols."
                 )
-            # Ensure all symbols are uppercase
+
             STOCK_SYMBOLS = [symbol.upper() for symbol in STOCK_SYMBOLS]
-            # Remove duplicates
             STOCK_SYMBOLS = list(set(STOCK_SYMBOLS))
-            # Remove empty strings
             STOCK_SYMBOLS = [symbol for symbol in STOCK_SYMBOLS if symbol]
             logger.info(f"Loaded stock symbols from stocks.json: {STOCK_SYMBOLS}")
         except Exception as e:
             logger.error(f"Error loading stock symbols from stocks.json: {e}")
 
-# RL model parameters - Optimized for SPEED with 15 symbols
+
 STATE_DIM = (len(STOCK_SYMBOLS) * 2) + 1 + (len(STOCK_SYMBOLS) * LOOKBACK_WINDOW)
 ACTION_DIM = len(STOCK_SYMBOLS)
-LEARNING_RATE = 0.001  # Increased for faster convergence
-GAMMA = 0.99  # Higher discount factor for better long-term planning
-BATCH_SIZE = 2048  # Increased batch size for better GPU utilization
-MEMORY_SIZE = 75000  # Increased memory for better experience diversity with more symbols
-NOISE_SIGMA = 0.3  # Higher noise for better exploration
-NOISE_THETA = 0.2  # Faster noise decay
+LEARNING_RATE = 0.0001
+GAMMA = 0.99
+BATCH_SIZE = 512
+MEMORY_SIZE = 50000
+NOISE_SIGMA = 0.2
+NOISE_THETA = 0.15
 
 # Load hyperparameters if available
 hyperparams_path = Path("./hyperparameters.json")
@@ -127,47 +125,39 @@ CACHE_DIR.mkdir(exist_ok=True)
 # Data source configuration
 USE_YFINANCE = True
 
-# ===== AUTOMATION CONFIGURATION =====
-# Weekend training parameters optimized for 65.5 hour window
+# Automation configuration
 AUTOMATION_CONFIG = {
-    # Training configuration
-    "training_epochs": 300,  # Balanced: good learning, fits timeframe
-    "training_sessions": 8,   # Multiple sessions for better convergence
-    "optimization_trials": 50, # Sufficient for hyperparameter tuning
+    "training_epochs": 300,
+    "training_sessions": 8,
+    "optimization_trials": 50,
     
-    # Market automation settings
     "live_trading_enabled": True,
     "auto_restart": True,
-    "check_interval": 60,  # seconds
+    "check_interval": 60,
     "weekend_intensive_training": True,
-    
-    # Timing estimates (based on 40s/episode, 8min/trial)
     "training_schedule": {
         "friday_after_close": {
             "optimization_trials": 50,
-            "estimated_time_hours": 6.7  # 50 trials × 8min
+            "estimated_time_hours": 6.7
         },
         "weekend_training": {
             "episodes_per_session": 300,
             "sessions": 8,
-            "estimated_time_per_session_hours": 3.3,  # 300 × 40s
-            "total_estimated_hours": 26.4  # 8 × 3.3h
+            "estimated_time_per_session_hours": 3.3,
+            "total_estimated_hours": 26.4
         },
-        "total_weekend_usage_hours": 33.1,  # 6.7 + 26.4
+        "total_weekend_usage_hours": 33.1,
         "available_weekend_hours": 65.5,
-        "safety_margin_hours": 32.4,  # 49% buffer
+        "safety_margin_hours": 32.4,
         "completion_target": "Sunday evening"
     },
     
-    # Performance targets and limits
     "performance_targets": {
         "max_episode_time_seconds": 45,
         "max_training_session_hours": 4,
         "max_optimization_hours": 8,
-        "target_weekend_utilization": 0.5  # Use 50% of available time
+        "target_weekend_utilization": 0.5
     },
-    
-    # Health monitoring thresholds
     "health_checks": {
         "min_disk_space_gb": 1.0,
         "min_memory_gb": 2.0,

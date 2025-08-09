@@ -1,1 +1,0 @@
-Fix the code in the directory autonomously, browse these pages for docs: https://docs.alpaca.markets/reference/stocklatestbars https://docs.alpaca.markets/reference/stockbars remove yfinance and assume a 15 minute delay as delayed_sip for live, so account for this in training

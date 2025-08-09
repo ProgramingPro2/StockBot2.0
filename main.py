@@ -3,14 +3,12 @@ import time
 import sys
 import os
 
-# Set TensorFlow environment variables to suppress warnings and optimize performance
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow logging
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'  # Enable oneDNN optimizations
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Allow GPU memory growth
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-# Set matplotlib to use non-interactive backend to prevent Tkinter issues
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
+matplotlib.use('Agg')
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
@@ -32,21 +30,17 @@ from stock_env import StockTradingEnvironment
 from alpaca_trade_system import AlpacaTradingSystem
 from performance_monitor import PerformanceMonitor
 
-# Clear app.log properly
 if Path("app.log").exists():
-    Path("app.log").unlink()  # Remove the file completely
-
-# Configure logging
+    Path("app.log").unlink()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     filename="app.log",
-    filemode="w"  # Use 'w' for write mode to start fresh
+    filemode="w"
 )
 logger = logging.getLogger(__name__)
 
-# TensorFlow Performance Optimizations
-tf.config.optimizer.set_jit(True)  # Enable XLA JIT compilation
+tf.config.optimizer.set_jit(True)
 tf.config.optimizer.set_experimental_options({
     "layout_optimizer": True,
     "constant_folding": True,
@@ -59,48 +53,35 @@ tf.config.optimizer.set_experimental_options({
     "debug_stripper": True,
 })
 
-# Enable mixed precision for faster training on modern GPUs
-# Temporarily disabled for compatibility
-# policy = tf.keras.mixed_precision.Policy('mixed_float16')
-# tf.keras.mixed_precision.set_global_policy(policy)
 
-# Use float32 for better compatibility
 policy = tf.keras.mixed_precision.Policy('float32')
 tf.keras.mixed_precision.set_global_policy(policy)
 
-# GPU memory optimization - Set memory growth BEFORE configuring virtual devices
+
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
-        # Set memory growth for all GPUs FIRST
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
         
-        # Then configure virtual devices if needed
         for gpu in gpus:
-            # Set memory limit to 6GB for better performance
             tf.config.set_logical_device_configuration(
                 gpu,
-                [tf.config.LogicalDeviceConfiguration(memory_limit=1024*6)]  # 6GB limit for better performance
+                [tf.config.LogicalDeviceConfiguration(memory_limit=1024*6)]
             )
         
         logical_gpus = tf.config.list_logical_devices('GPU')
         print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
         logger.info(f"GPU is available. Found {len(gpus)} GPU(s).")
         
-        # Set default device to GPU
         tf.config.set_visible_devices(gpus[0], 'GPU')
         logger.info("Default device set to GPU")
     except RuntimeError as e:
-        # Memory growth must be set before GPUs have been initialized
         logger.error(f"GPU configuration failed: {e}")
 else:
     logger.info("No GPU found, using CPU.")
 
-# Enable eager execution
 tf.config.run_functions_eagerly(False)
-
-# Load environment variables
 dotenv.load_dotenv()
 
 def _verify_gpu_availability():
@@ -135,12 +116,12 @@ def check_system_health():
     logger.info(f"Health checks passed. Trading {len(STOCK_SYMBOLS)} symbols")
     return True
 
-# Defer Alpaca connections until needed (avoids requiring keys for yfinance training)
+
 trading_client = None
 stock_data_client = None
 
 
-# Removed optimization function - use unified training instead
+
 
 
 def _initialize_training_environment(debug=False):
@@ -346,7 +327,7 @@ def train_agent(debug=False):
     return agent
 
 
-# Removed fast training - unified into main train_agent
+
 
 
 def optimize_agent(trials=20):
