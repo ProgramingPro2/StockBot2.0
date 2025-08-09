@@ -17,7 +17,7 @@ import os
 import time
 
 # Ensure config.py is correctly set up with your keys
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, USE_YFINANCE
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, USE_YFINANCE, ALLOW_SHORT_SELLING
 
 logger = logging.getLogger(__name__)
 
@@ -499,13 +499,15 @@ class StockTradingEnvironment:
             max_trade_amount = 10.0  # Maximum shares per trade
             trade_amounts = tf.clip_by_value(trade_amounts, -max_trade_amount, max_trade_amount)
             
-            # FIRST: Prevent selling more shares than we own (apply share protection BEFORE any other calculations)
-            max_sellable = self.shares_tensor  # Can't sell more than we own
-            trade_amounts = tf.where(
-                trade_amounts < 0,  # For sells
-                tf.maximum(trade_amounts, -max_sellable),  # Limit sells to available shares
-                trade_amounts  # Keep buys unchanged
-            )
+            # Apply share protection if short selling is disabled
+            if not ALLOW_SHORT_SELLING:
+                # Prevent selling more shares than we own (apply share protection BEFORE any other calculations)
+                max_sellable = self.shares_tensor  # Can't sell more than we own
+                trade_amounts = tf.where(
+                    trade_amounts < 0,  # For sells
+                    tf.maximum(trade_amounts, -max_sellable),  # Limit sells to available shares
+                    trade_amounts  # Keep buys unchanged
+                )
             
             # Don't allow buying if balance is zero (tensor-safe)
             balance_nonpos = tf.less_equal(self.balance_tensor, 0.0)
@@ -541,8 +543,11 @@ class StockTradingEnvironment:
             # Calculate new balance - now net cost should NEVER be negative since we can't sell what we don't have
             new_balance = tf.maximum(self.balance_tensor - tf.reduce_sum(final_trade_costs), 0.0)
             
-            # Update shares
-            new_shares = tf.maximum(self.shares_tensor + final_trade_amounts, 0.0)
+            # Update shares (allow negative shares if short selling is enabled)
+            if ALLOW_SHORT_SELLING:
+                new_shares = self.shares_tensor + final_trade_amounts
+            else:
+                new_shares = tf.maximum(self.shares_tensor + final_trade_amounts, 0.0)
             
             # DEBUG: Log final calculations
             if hasattr(self, 'debug') and self.debug:
@@ -606,6 +611,16 @@ class StockTradingEnvironment:
                 transaction_fee = abs(trade_cost) * 0.001
                 total_cost = trade_cost + transaction_fee
             
+            # Check short selling constraints
+            if not ALLOW_SHORT_SELLING and trade_amount < 0:
+                # Prevent selling more shares than we own
+                available_shares = self.shares[symbol]
+                if abs(trade_amount) > available_shares:
+                    trade_amount = -available_shares  # Sell only what we have
+                    trade_cost = trade_amount * current_price
+                    transaction_fee = abs(trade_cost) * 0.001
+                    total_cost = trade_cost + transaction_fee
+            
             # Execute the trade
             old_balance = self.balance
             old_shares = self.shares[symbol]
@@ -614,9 +629,12 @@ class StockTradingEnvironment:
             if self.debug:
                 logger.info(f"TRADE EXECUTED: {symbol} {trade_amount:+.2f} shares, Balance: ${old_balance:.2f} -> ${self.balance:.2f}, Shares: {old_shares:.2f} -> {self.shares[symbol]:.2f}")
             
-            # Prevent negative balance and shares
+            # Prevent negative balance
             self.balance = max(self.balance, 0.0)
-            self.shares[symbol] = max(self.shares[symbol], 0.0)
+            
+            # Prevent negative shares only if short selling is disabled
+            if not ALLOW_SHORT_SELLING:
+                self.shares[symbol] = max(self.shares[symbol], 0.0)
             
             # Debug: Log individual trades
             if self.debug and trade_amount != 0:

@@ -225,6 +225,7 @@ AUTOMATION_CONFIG = {
 STOCK_SYMBOLS = ["AAPL", "GOOGL", "MSFT", "TSLA", "AMZN"]  # Loaded from stocks.json
 INITIAL_BALANCE = 1000.0           # Starting portfolio value
 MAX_SHARES_PER_TRADE = 5           # Position size limit
+ALLOW_SHORT_SELLING = False        # Enable short selling (off by default)
 REWARD_SCALING_FACTOR = 0.01       # Learning reward scale
 
 # Neural network hyperparameters
@@ -232,6 +233,26 @@ LEARNING_RATE = 0.0001             # Adam optimizer learning rate
 BATCH_SIZE = 512                   # Training batch size
 MEMORY_SIZE = 50000                # Experience replay buffer size
 ```
+
+#### Short Selling Configuration
+
+Control whether the agent can take short positions:
+
+```python
+# Enable short selling (advanced - higher risk)
+ALLOW_SHORT_SELLING = True   # Allow negative share positions
+
+# Disable short selling (default - safer)
+ALLOW_SHORT_SELLING = False  # Only sell owned shares
+```
+
+**Short Selling Behavior:**
+
+- ✅ **Enabled**: Agent can have negative share positions (short positions)
+- ❌ **Disabled**: Agent can only sell shares it owns (long-only strategy)
+- 🛡️ **Default**: Disabled for safety and regulatory compliance
+- ⚠️ **Risk**: Short positions have unlimited loss potential
+- 📊 **Portfolio**: Negative shares show as negative value (liability)
 
 ## 🏗️ Architecture
 
