@@ -423,7 +423,17 @@ class MarketAutomation:
         was_open = self.market_status == "open"
         is_open = self.is_market_open()
         
-        if is_open and not was_open:
+        # Initialize market status if unknown
+        if self.market_status == "unknown":
+            if is_open:
+                logger.info("Initial check: Market is open - starting live trading")
+                self.market_status = "open"
+                self.start_live_trading()
+            else:
+                logger.info("Initial check: Market is closed - ready for training")
+                self.market_status = "closed"
+        
+        elif is_open and not was_open:
             logger.info("Market opened - starting live trading")
             self.market_status = "open"
             self.start_live_trading()

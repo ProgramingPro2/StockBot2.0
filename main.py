@@ -24,7 +24,7 @@ import optuna
 from collections import deque
 
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER_TRADING, STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR, STATE_DIM, ACTION_DIM, LEARNING_RATE, BATCH_SIZE, GAMMA, MEMORY_SIZE, NOISE_SIGMA, NOISE_THETA, TRAINING_EPISODES, TEST_EPISODES, TRADING_FREQUENCY
-from utils import invalidate_cache
+from utils import invalidate_cache, configure_ssl_settings
 from system_utils import comprehensive_system_check, ConfigurationValidator
 from drl_agent import DRLAgent
 from stock_env import StockTradingEnvironment
@@ -40,6 +40,9 @@ logging.basicConfig(
     filemode="w"
 )
 logger = logging.getLogger(__name__)
+
+# Configure SSL settings early to prevent SSL errors
+configure_ssl_settings()
 
 tf.config.optimizer.set_jit(True)
 tf.config.optimizer.set_experimental_options({

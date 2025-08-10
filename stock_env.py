@@ -705,6 +705,11 @@ class StockTradingEnvironment:
         # Use yfinance for faster data fetching
         if USE_YFINANCE:
             data, failed_symbols = self._get_yfinance_data()
+            
+            # If yfinance failed for all symbols, fallback to Alpaca
+            if not data and failed_symbols and len(failed_symbols) == len(self.symbols):
+                logger.warning("yfinance failed for all symbols, falling back to Alpaca data")
+                data, failed_symbols = self._get_alpaca_data()
         else:
             data, failed_symbols = self._get_alpaca_data()
         
@@ -872,6 +877,53 @@ class StockTradingEnvironment:
         failed_symbols = []
         end_date = datetime.now()
         start_date = end_date - timedelta(days=729)
+        
+        # Configure yfinance with better error handling and retry logic
+        import yfinance as yf
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        import ssl
+        
+        # Create a custom session with retry logic and SSL configuration
+        session = requests.Session()
+        
+        # Configure retry strategy for rate limiting and temporary failures
+        retry_strategy = Retry(
+            total=5,  # Total number of retries
+            backoff_factor=2,  # Exponential backoff: 2, 4, 8, 16, 32 seconds
+            status_forcelist=[429, 500, 502, 503, 504, 520, 521, 522, 523, 524],  # Retry on these status codes
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]  # Allow retries on POST requests
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Configure SSL context to handle cipher suite issues
+        try:
+            # Create a custom SSL context with more compatible cipher suites
+            ssl_context = ssl.create_default_context()
+            ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')  # Use more compatible cipher suites
+            ssl_context.check_hostname = True
+            ssl_context.verify_mode = ssl.CERT_REQUIRED
+            
+            # Apply the SSL context to the session
+            session.verify = True
+            session.ssl_context = ssl_context
+        except Exception as e:
+            logger.warning(f"Could not configure custom SSL context: {e}")
+        
+        # Set headers to mimic a real browser
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        })
+        
         for symbol in self.symbols:
             cache_file = self.cache_dir / f"{symbol}_yfinance.pkl"
             try:
@@ -884,13 +936,54 @@ class StockTradingEnvironment:
                     else:
                         raise ValueError("Cached data is empty.")
                 else:
-                    stock_data = yf.download(symbol, start=start_date, end=end_date, interval="1h", progress=False, auto_adjust=True)
-                    if not stock_data.empty:
-                        data[symbol] = stock_data
-                        stock_data.to_pickle(cache_file)
+                    # Use the custom session for yfinance downloads
+                    max_retries = 3
+                    retry_delay = 5
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            # Download with error handling (let yfinance handle its own session)
+                            stock_data = yf.download(
+                                symbol, 
+                                start=start_date, 
+                                end=end_date, 
+                                interval="1h", 
+                                progress=False, 
+                                auto_adjust=True,
+                                timeout=30  # Add timeout to prevent hanging
+                            )
+                            
+                            if not stock_data.empty:
+                                data[symbol] = stock_data
+                                stock_data.to_pickle(cache_file)
+                                logger.info(f"Successfully downloaded data for {symbol}")
+                                break  # Success, exit retry loop
+                            else:
+                                raise ValueError(f"No data returned for {symbol}")
+                                
+                        except Exception as e:
+                            error_msg = str(e)
+                            if attempt < max_retries - 1:
+                                if "429" in error_msg or "Too Many Requests" in error_msg:
+                                    wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                                    logger.warning(f"Rate limited for {symbol}, waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                                    time.sleep(wait_time)
+                                elif "SSL" in error_msg or "TLS" in error_msg or "BAD_DECRYPT" in error_msg:
+                                    logger.warning(f"SSL error for {symbol}, retrying {attempt + 1}/{max_retries}: {error_msg}")
+                                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                                else:
+                                    logger.warning(f"Download error for {symbol}, retrying {attempt + 1}/{max_retries}: {error_msg}")
+                                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                            else:
+                                # Final attempt failed
+                                logger.error(f"Failed to download data for {symbol} after {max_retries} attempts: {error_msg}")
+                                failed_symbols.append(symbol)
+                                break
+                                
             except Exception as e:
                 logger.error(f"Failed to download or load data for {symbol}: {e}")
                 failed_symbols.append(symbol)
+                
         return data, failed_symbols
 
     def prefetch_data(self):
