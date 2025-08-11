@@ -203,10 +203,15 @@ class DRLAgent:
         next_states = tf.cast(next_states, tf.float32)
         dones = tf.cast(dones, tf.float32)
         
-        with tf.GradientTape(persistent=True) as tape:
+        # Use separate gradient tapes to avoid memory accumulation
+        with tf.GradientTape() as actor_tape:
             # Actor forward pass
             actions_pred = self.actor(states)
             
+            # Actor loss (maximize Q-values)
+            actor_loss = -tf.reduce_mean(self.critic([states, actions_pred]))
+        
+        with tf.GradientTape() as critic_tape:
             # Critic forward pass for current state-action pairs
             q_values = self.critic([states, actions])
             
@@ -219,13 +224,10 @@ class DRLAgent:
             
             # Calculate losses
             critic_loss = tf.reduce_mean(tf.square(q_values[:, 0] - q_targets))
-            
-            # Actor loss (maximize Q-values)
-            actor_loss = -tf.reduce_mean(self.critic([states, actions_pred]))
         
         # Calculate gradients
-        actor_gradients = tape.gradient(actor_loss, self.actor.trainable_variables)
-        critic_gradients = tape.gradient(critic_loss, self.critic.trainable_variables)
+        actor_gradients = actor_tape.gradient(actor_loss, self.actor.trainable_variables)
+        critic_gradients = critic_tape.gradient(critic_loss, self.critic.trainable_variables)
         
         # Apply gradients
         self.actor_optimizer.apply_gradients(zip(actor_gradients, self.actor.trainable_variables))

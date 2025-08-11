@@ -98,54 +98,49 @@ class ReplayBuffer:
             batch_size: The batch size for the dataset.
 
         Returns:
-            A tf.data.Dataset object or None if the buffer is empty.
+            A tf.data.Dataset iterator for training.
         """
-        if self.size == 0:
+        if self.size < batch_size:
             return None
 
-        # Use GPU tensors if available for faster dataset creation
+        # Use GPU tensors if available, otherwise use CPU
         if self.use_gpu_tensors:
             try:
                 with tf.device(self.device):
-                    # Create tensors directly from GPU memory
-                    states_tensor = self.states_gpu[:self.size]
-                    actions_tensor = self.actions_gpu[:self.size]
-                    rewards_tensor = self.rewards_gpu[:self.size]
-                    next_states_tensor = self.next_states_gpu[:self.size]
-                    dones_tensor = self.dones_gpu[:self.size]
+                    # Create dataset from GPU tensors
+                    dataset = tf.data.Dataset.from_tensor_slices((
+                        self.states_gpu[:self.size],
+                        self.actions_gpu[:self.size],
+                        self.rewards_gpu[:self.size],
+                        self.next_states_gpu[:self.size],
+                        self.dones_gpu[:self.size]
+                    ))
             except Exception as e:
-                print(f"GPU tensor access failed, falling back to CPU: {e}")
+                print(f"GPU dataset creation failed, falling back to CPU: {e}")
                 self.use_gpu_tensors = False
-                # Fall through to CPU tensors
-                states_tensor = tf.convert_to_tensor(self.states[:self.size], dtype=tf.float32)
-                actions_tensor = tf.convert_to_tensor(self.actions[:self.size], dtype=tf.float32)
-                rewards_tensor = tf.convert_to_tensor(self.rewards[:self.size], dtype=tf.float32)
-                next_states_tensor = tf.convert_to_tensor(self.next_states[:self.size], dtype=tf.float32)
-                dones_tensor = tf.convert_to_tensor(self.dones[:self.size], dtype=tf.float32)
-        else:
-            # Fallback to CPU tensors
-            states_tensor = tf.convert_to_tensor(self.states[:self.size], dtype=tf.float32)
-            actions_tensor = tf.convert_to_tensor(self.actions[:self.size], dtype=tf.float32)
-            rewards_tensor = tf.convert_to_tensor(self.rewards[:self.size], dtype=tf.float32)
-            next_states_tensor = tf.convert_to_tensor(self.next_states[:self.size], dtype=tf.float32)
-            dones_tensor = tf.convert_to_tensor(self.dones[:self.size], dtype=tf.float32)
+                # Fall through to CPU implementation
+                
+        if not self.use_gpu_tensors:
+            # Create dataset from CPU tensors
+            dataset = tf.data.Dataset.from_tensor_slices((
+                self.states[:self.size],
+                self.actions[:self.size],
+                self.rewards[:self.size],
+                self.next_states[:self.size],
+                self.dones[:self.size]
+            ))
 
-        # Create dataset with optimized settings
-        dataset = tf.data.Dataset.from_tensor_slices(
-            (states_tensor, actions_tensor, rewards_tensor, next_states_tensor, dones_tensor)
-        )
-
-        # Optimize dataset pipeline for better performance
-        dataset = (
-            dataset
-            .shuffle(buffer_size=min(self.size, 10000), reshuffle_each_iteration=True)
-            .batch(batch_size, drop_remainder=True)  # Drop remainder for consistent batch sizes
-            .repeat()  # Make dataset repeat infinitely to prevent "End of sequence"
-            .prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
-            .cache()  # Cache the dataset in memory for faster access
-        )
-
-        return dataset
+        # Optimize dataset performance
+        dataset = dataset.shuffle(buffer_size=min(10000, self.size))
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        
+        # Create iterator and clear any previous iterators to prevent memory leaks
+        if hasattr(self, '_current_iterator'):
+            del self._current_iterator
+        
+        self._current_iterator = iter(dataset)
+        return self._current_iterator
 
     def __len__(self):
         """Returns the current size of the replay buffer."""

@@ -6,6 +6,9 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+# Memory optimization settings
+os.environ['TF_MEMORY_ALLOCATION'] = '0.7'  # Use 70% of GPU memory max
+os.environ['USE_GPU_REPLAY_BUFFER'] = 'false'  # Disable GPU replay buffer by default
 
 import matplotlib
 matplotlib.use('Agg')
@@ -243,6 +246,9 @@ def _run_training_episode(agent, environment, dataset_iterator, training_params)
                 episode_losses.append(losses)
         training_params['steps_since_training'] = 0
     
+    # Clear TensorFlow memory after each episode
+    tf.keras.backend.clear_session()
+    
     return total_reward, episode_losses, info
 
 def _calculate_episode_metrics(episode_losses):
@@ -361,9 +367,29 @@ def train_agent(debug=False, time_limit_hours=None, max_time_hours=None):
         
         reward_history.append(total_reward)
         
+        # Memory monitoring and cleanup
+        if episode % 10 == 0:  # Every 10 episodes
+            try:
+                import psutil
+                memory = psutil.virtual_memory()
+                logger.debug(f"Memory usage: {memory.percent:.1f}% ({memory.available / (1024**3):.1f}GB available)")
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
+                
+                # Clear TensorFlow memory if GPU usage is high
+                if current_metrics and current_metrics.get('gpu_usage', 0) > 80:
+                    tf.keras.backend.clear_session()
+                    logger.debug("Cleared TensorFlow session due to high GPU usage")
+            except Exception as e:
+                logger.debug(f"Memory monitoring failed: {e}")
+        
         # Checkpoint saving
         if episode % training_config['checkpoint_interval'] == 0:
             agent.save_models()
+            # Clear memory periodically to prevent accumulation
+            tf.keras.backend.clear_session()
         
         # Early stopping check
         should_stop, best_reward, early_stopping_counter = _should_stop_early(
@@ -387,6 +413,9 @@ def train_agent(debug=False, time_limit_hours=None, max_time_hours=None):
     # Training completion
     monitor.stop_monitoring()
     total_training_time = time.time() - training_start_time
+    
+    # Final memory cleanup
+    tf.keras.backend.clear_session()
     
     logger.info(f"Training completed in {total_training_time:.1f} seconds")
     logger.info(f"Average time per episode: {total_training_time/TRAINING_EPISODES:.2f} seconds")
@@ -659,7 +688,7 @@ def run_live_trading():
     """
     Runs the agent in live trading mode with Alpaca.
     """
-    logger.info("Starting live trading...")
+    logger.info(f"🚀 Starting live trading with {TRADING_FREQUENCY} frequency...")
     # Load trained agent
     agent = DRLAgent(
         STATE_DIM,
@@ -739,7 +768,7 @@ def run_live_trading():
 
                     # Log the actions in a more readable format
                     action_summary = []
-                    if actions:
+                    if actions is not None and len(actions) > 0:
                         for i, symbol in enumerate(STOCK_SYMBOLS):
                             signal = actions[i]
                             if signal > 0.1:  # Buy signal
@@ -793,7 +822,7 @@ def run_live_trading():
                         logger.info("Waiting for next hourly window...")
                         time.sleep(60 * 60)  # Sleep for 1 hour
                     else:  # "minute"
-                        logger.info("Waiting for next minute window...")
+                        logger.info("🕐 MINUTE TRADING: Waiting for next minute window...")
                         time.sleep(60)  # Sleep for 1 minute
                 else:
                     logger.info("Market is closed. Waiting for market to open...")

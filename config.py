@@ -80,8 +80,8 @@ STOCK_SYMBOLS = [
 ]
 INITIAL_BALANCE = 1000.0
 LOOKBACK_WINDOW = 168
-TRADING_FREQUENCY = "hourly"
-MAX_SHARES_PER_TRADE = 5
+TRADING_FREQUENCY = "minute"
+MAX_SHARES_PER_TRADE = 3  # More active for minute trading
 ALLOW_SHORT_SELLING = False  # Enable short selling (selling stocks you don't own)
 TRAINING_EPISODES = 500
 TEST_EPISODES = 50
