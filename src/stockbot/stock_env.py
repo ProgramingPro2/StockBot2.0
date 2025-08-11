@@ -17,6 +17,9 @@ import os
 import time
 
 # Ensure config.py is correctly set up with your keys
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, USE_YFINANCE, ALLOW_SHORT_SELLING
 
 logger = logging.getLogger(__name__)

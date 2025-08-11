@@ -21,21 +21,52 @@ wheels/
 *.egg
 MANIFEST
 
-# Virtual environments
-.env
+# Virtual Environment
 .venv/
-env/
 venv/
 ENV/
-env.bak/
+env/
+.venv.bak/
 venv.bak/
 
-# IDEs
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+
+# Logs
+*.log
+logs/
+app.log
+market_automation.log
+
+# Data and Cache
+data_cache/
+*.pkl
+*.npz
+*.h5
+*.hdf5
+
+# Models and Checkpoints
+models/
+checkpoints/
+*.ckpt
+*.weights
+*.model
+
+# Generated Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+
+# Environment files
+.env
+.env.local
+.env.production
 
 # OS
 .DS_Store
@@ -46,55 +77,86 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
-# Project specific
-*.log
-*.pid
-app.log*
-market_automation.log*
-training_performance.png
-test_results.png
-final_values_distribution.png
-fast_training_performance.png
-
-# Model files and checkpoints
-models/
-checkpoints/
-*.h5
-*.keras
-*.ckpt*
-best_params.json
-
-# Data cache
-data_cache/
-*.csv
-*.json.bak
-
 # Temporary files
 *.tmp
 *.temp
-.cache/
+*.bak
+*.backup
 
-# API Keys and secrets (IMPORTANT!)
-.env
-*.key
-*.pem
-api_keys.txt
-secrets.txt
-
-# TensorFlow logs
-logs/
-tensorboard_logs/
-
-# Jupyter notebooks
+# Jupyter Notebooks
 .ipynb_checkpoints/
-*.ipynb
 
-# pytest
-.pytest_cache/
-.coverage
+# Coverage reports
 htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
 
 # mypy
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# StockBot specific
+market_automation.pid
+start_market_automation.sh
+stockbot-automation.service

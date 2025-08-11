@@ -24,12 +24,12 @@ import optuna
 from collections import deque
 
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER_TRADING, STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR, STATE_DIM, ACTION_DIM, LEARNING_RATE, BATCH_SIZE, GAMMA, MEMORY_SIZE, NOISE_SIGMA, NOISE_THETA, TRAINING_EPISODES, TEST_EPISODES, TRADING_FREQUENCY
-from utils import invalidate_cache, configure_ssl_settings
-from system_utils import comprehensive_system_check, ConfigurationValidator
-from drl_agent import DRLAgent
-from stock_env import StockTradingEnvironment
-from alpaca_trade_system import AlpacaTradingSystem
-from performance_monitor import PerformanceMonitor
+from src.stockbot.utils import invalidate_cache, configure_ssl_settings
+from src.stockbot.system_utils import comprehensive_system_check, ConfigurationValidator
+from src.stockbot.drl_agent import DRLAgent
+from src.stockbot.stock_env import StockTradingEnvironment
+from src.stockbot.alpaca_trade_system import AlpacaTradingSystem
+from src.stockbot.performance_monitor import PerformanceMonitor
 
 if Path("app.log").exists():
     Path("app.log").unlink()
@@ -431,16 +431,18 @@ def optimize_agent(trials=20, time_limit_hours=None, max_time_hours=None):
             batch_size = trial.suggest_categorical("batch_size", [256, 512, 1024])
             gamma = trial.suggest_float("gamma", 0.9, 0.99)
             noise_sigma = trial.suggest_float("noise_sigma", 0.05, 0.3)
+            noise_theta = trial.suggest_float("noise_theta", 0.1, 0.5)
+            reward_scaling_factor = trial.suggest_float("reward_scaling_factor", 1.0, 50.0)
             
             # Create environment and agent with suggested params
             env = StockTradingEnvironment(STOCK_SYMBOLS, INITIAL_BALANCE, LOOKBACK_WINDOW, 
-                                        stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, REWARD_SCALING_FACTOR)
+                                        stock_data_client, CACHE_DIR, MAX_SHARES_PER_TRADE, reward_scaling_factor)
             
             agent = DRLAgent(env.state_size, len(env.symbols), learning_rate=learning_rate, 
-                           gamma=gamma, memory_size=10000, noise_sigma=noise_sigma, noise_theta=0.15)
+                           gamma=gamma, memory_size=10000, noise_sigma=noise_sigma, noise_theta=noise_theta)
             
             # Quick training and evaluation
-            total_reward = 0
+            total_portfolio_values = []
             for episode in range(10):  # Quick evaluation
                 # Check time limits during optimization
                 current_time = time.time()
@@ -456,15 +458,23 @@ def optimize_agent(trials=20, time_limit_hours=None, max_time_hours=None):
                 
                 state = env.reset()
                 episode_reward = 0
+                final_portfolio_value = INITIAL_BALANCE
+                
                 for step in range(100):  # Short episodes
                     action = agent.act(state)
-                    next_state, reward, done, _ = env.step(action)
+                    next_state, reward, done, info = env.step(action)
                     agent.remember(state, action, reward, next_state, done)
                     state = next_state
                     episode_reward += reward
+                    
+                    # Track final portfolio value
+                    if 'portfolio_value' in info:
+                        final_portfolio_value = info['portfolio_value']
+                    
                     if done:
                         break
-                total_reward += episode_reward
+                
+                total_portfolio_values.append(final_portfolio_value)
                 
                 if len(agent.memory) >= batch_size:
                     try:
@@ -475,7 +485,9 @@ def optimize_agent(trials=20, time_limit_hours=None, max_time_hours=None):
                     except Exception as e:
                         logger.warning(f"Training error: {e}")
             
-            return total_reward / max(1, episode + 1)  # Average reward over completed episodes
+            # Return average portfolio value (more meaningful than reward)
+            avg_portfolio_value = sum(total_portfolio_values) / len(total_portfolio_values) if total_portfolio_values else INITIAL_BALANCE
+            return avg_portfolio_value
         
         # Create study and optimize
         study = optuna.create_study(direction="maximize")
@@ -489,12 +501,13 @@ def optimize_agent(trials=20, time_limit_hours=None, max_time_hours=None):
         logger.info(f"Best trial: {study.best_trial.value}")
         logger.info(f"Best params: {study.best_trial.params}")
         
-        # Save best parameters
+        # Save best parameters to hyperparameters.json (used by config)
         best_params = study.best_trial.params
-        with open("best_params.json", "w") as f:
+        with open("hyperparameters.json", "w") as f:
             json.dump(best_params, f, indent=2)
         
         logger.info("Optimization completed successfully")
+        logger.info(f"Best parameters saved to hyperparameters.json: {best_params}")
         return best_params
         
     except ImportError:

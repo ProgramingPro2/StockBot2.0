@@ -7,6 +7,9 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 import time # Added for retry logic
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from config import (
     INITIAL_BALANCE,
     LOOKBACK_WINDOW,

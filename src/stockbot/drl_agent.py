@@ -10,8 +10,8 @@ import numpy as np
 from pathlib import Path
 import logging
 
-from noise import OrnsteinUhlenbeckActionNoise
-from replay_buffer import ReplayBuffer
+from .noise import OrnsteinUhlenbeckActionNoise
+from .replay_buffer import ReplayBuffer
 
 logger = logging.getLogger(__name__)
 
