@@ -24,6 +24,7 @@ from config import (
     LOOKBACK_WINDOW,
     MAX_SHARES_PER_TRADE,
     ALLOW_SHORT_SELLING,
+    PDT_PROTECTION_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,10 @@ class AlpacaTradingSystem:
         self.symbols = symbols
         self.trading_client = trading_client
         self.stock_data_client = stock_data_client
+        
+        # PDT protection tracking
+        self.daily_trade_direction = {}  # Track buy/sell direction per symbol per day
+        self.last_trading_day = None  # Track when we last reset the daily tracking
 
     def _get_current_state(self):
         """Creates the current state based on market data and account information using Alpaca API.
@@ -219,6 +224,51 @@ class AlpacaTradingSystem:
 
         return np.array(state, dtype=np.float32), current_prices
 
+    def _check_and_reset_daily_tracking(self):
+        """
+        Check if we need to reset daily trade direction tracking.
+        Resets tracking at the start of each trading day (9:30 AM ET).
+        """
+        if not PDT_PROTECTION_ENABLED:
+            return
+            
+        current_time = datetime.now()
+        current_trading_day = current_time.strftime('%Y-%m-%d')
+        
+        # Reset tracking if it's a new trading day
+        if self.last_trading_day != current_trading_day:
+            if self.daily_trade_direction:
+                logger.info(f"New trading day detected. Resetting daily trade direction tracking.")
+            self.daily_trade_direction = {}
+            self.last_trading_day = current_trading_day
+
+    def _check_pdt_restriction(self, symbol, trade_direction, portfolio_value):
+        """
+        Check if a trade should be blocked due to PDT restrictions.
+        
+        Args:
+            symbol: Stock symbol
+            trade_direction: 'BUY' or 'SELL'
+            portfolio_value: Current portfolio value
+            
+        Returns:
+            bool: True if trade should be blocked, False if allowed
+        """
+        if not PDT_PROTECTION_ENABLED or portfolio_value >= 25000:
+            return False
+            
+        # Check if we've already traded this symbol today
+        if symbol in self.daily_trade_direction:
+            if self.daily_trade_direction[symbol] != trade_direction:
+                logger.info(f"PDT Protection: Skipping {symbol} {trade_direction} - already traded {self.daily_trade_direction[symbol]} today (Portfolio: ${portfolio_value:.2f})")
+                return True
+        else:
+            # First trade of the day for this symbol - record the direction
+            self.daily_trade_direction[symbol] = trade_direction
+            logger.info(f"PDT Protection: First trade of day for {symbol} - direction set to {trade_direction} (Portfolio: ${portfolio_value:.2f})")
+            
+        return False
+
     def _get_price_data_yfinance(self, symbols, end_date, start_date):
         """
         Get price data from yfinance as primary data source.
@@ -284,6 +334,9 @@ class AlpacaTradingSystem:
         Returns:
             A list of action values (floats) for each symbol.
         """
+        # Check and reset daily tracking for PDT protection
+        self._check_and_reset_daily_tracking()
+        
         # Get current state
         state, current_prices = self._get_current_state()
 
@@ -302,6 +355,15 @@ class AlpacaTradingSystem:
         except Exception as e:
             logger.error(f"Error getting positions: {e}")
             positions = {sym: {"qty": 0} for sym in self.symbols}
+            
+        # Calculate current portfolio value for PDT protection
+        portfolio_value = 0.0
+        try:
+            account = self.trading_client.get_account()
+            portfolio_value = float(account.portfolio_value)
+        except Exception as e:
+            logger.warning(f"Could not get portfolio value for PDT check: {e}")
+            portfolio_value = 1000.0  # Default fallback
 
         # Execute actions
         trades_attempted = 0
@@ -314,6 +376,10 @@ class AlpacaTradingSystem:
             current_shares = positions.get(symbol, {}).get("qty", 0)
 
             if signal > 0:  # Buy signal
+                # Check PDT protection
+                if self._check_pdt_restriction(symbol, "BUY", portfolio_value):
+                    continue  # Skip this trade due to PDT restriction
+                    
                 shares_to_buy = max(1, int(signal * MAX_SHARES_PER_TRADE))
                 logger.debug(f"BUY SIGNAL {symbol}: signal={signal:.3f}, shares_to_buy={shares_to_buy}")
                 trades_attempted += 1
@@ -341,6 +407,10 @@ class AlpacaTradingSystem:
             elif signal < 0:  # Sell signal
                 # Check if we can sell (either have shares or short selling is allowed)
                 if current_shares > 0 or ALLOW_SHORT_SELLING:
+                    # Check PDT protection
+                    if self._check_pdt_restriction(symbol, "SELL", portfolio_value):
+                        continue  # Skip this trade due to PDT restriction
+                        
                     shares_to_sell = max(1, int(
                         -signal * min(MAX_SHARES_PER_TRADE, current_shares if not ALLOW_SHORT_SELLING else MAX_SHARES_PER_TRADE)
                     ))

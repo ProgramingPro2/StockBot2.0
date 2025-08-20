@@ -20,7 +20,7 @@ import time
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, USE_YFINANCE, ALLOW_SHORT_SELLING
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, USE_YFINANCE, ALLOW_SHORT_SELLING, PDT_PROTECTION_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,10 @@ class StockTradingEnvironment:
         
         # Initialize current_prices
         self.current_prices = {symbol: 100.0 for symbol in self.symbols}
+        
+        # PDT protection tracking for simulation
+        self.daily_trade_direction = {}  # Track buy/sell direction per symbol per day
+        self.last_trading_day = None  # Track when we last reset the daily tracking
         
         # GPU acceleration: Pre-allocate tensors on GPU
         self.device = '/GPU:0' if tf.config.list_physical_devices('GPU') else '/CPU:0'
@@ -146,6 +150,51 @@ class StockTradingEnvironment:
             logger.info(f"Environment reset complete. Current step: {self.current_step}, No valid data available")
         
         return self._get_state()
+
+    def _check_and_reset_daily_tracking(self):
+        """
+        Check if we need to reset daily trade direction tracking.
+        Resets tracking at the start of each trading day (9:30 AM ET).
+        """
+        if not PDT_PROTECTION_ENABLED:
+            return
+            
+        current_time = datetime.now()
+        current_trading_day = current_time.strftime('%Y-%m-%d')
+        
+        # Reset tracking if it's a new trading day
+        if self.last_trading_day != current_trading_day:
+            if self.daily_trade_direction:
+                logger.info(f"New trading day detected. Resetting daily trade direction tracking.")
+            self.daily_trade_direction = {}
+            self.last_trading_day = current_trading_day
+
+    def _check_pdt_restriction(self, symbol, trade_direction, portfolio_value):
+        """
+        Check if a trade should be blocked due to PDT restrictions.
+        
+        Args:
+            symbol: Stock symbol
+            trade_direction: 'BUY' or 'SELL'
+            portfolio_value: Current portfolio value
+            
+        Returns:
+            bool: True if trade should be blocked, False if allowed
+        """
+        if not PDT_PROTECTION_ENABLED or portfolio_value >= 25000:
+            return False
+            
+        # Check if we've already traded this symbol today
+        if symbol in self.daily_trade_direction:
+            if self.daily_trade_direction[symbol] != trade_direction:
+                logger.info(f"PDT Protection: Skipping {symbol} {trade_direction} - already traded {self.daily_trade_direction[symbol]} today (Portfolio: ${portfolio_value:.2f})")
+                return True
+        else:
+            # First trade of the day for this symbol - record the direction
+            self.daily_trade_direction[symbol] = trade_direction
+            logger.info(f"PDT Protection: First trade of day for {symbol} - direction set to {trade_direction} (Portfolio: ${portfolio_value:.2f})")
+            
+        return False
 
     def _calculate_portfolio_value_gpu(self, current_prices):
         """
@@ -376,6 +425,9 @@ class StockTradingEnvironment:
         Returns:
             tuple: (next_state, reward, done, info)
         """
+        # Check and reset daily tracking for PDT protection
+        self._check_and_reset_daily_tracking()
+        
         # Ensure action is the right type and shape
         action = np.array(action, dtype=np.float32)
         if len(action) != len(self.symbols):
@@ -389,6 +441,21 @@ class StockTradingEnvironment:
 
         # Update current prices
         self._update_current_prices()
+        
+        # Calculate current portfolio value for PDT protection
+        portfolio_value = self._calculate_portfolio_value()
+        
+        # Apply PDT protection by filtering actions
+        if PDT_PROTECTION_ENABLED and portfolio_value < 25000:
+            filtered_action = action.copy()
+            for i, symbol in enumerate(self.symbols):
+                if action[i] > 0:  # Buy signal
+                    if self._check_pdt_restriction(symbol, "BUY", portfolio_value):
+                        filtered_action[i] = 0.0  # Block the buy
+                elif action[i] < 0:  # Sell signal
+                    if self._check_pdt_restriction(symbol, "SELL", portfolio_value):
+                        filtered_action[i] = 0.0  # Block the sell
+            action = filtered_action
 
         # Execute trades
         if self.device == '/GPU:0':

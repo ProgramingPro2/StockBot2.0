@@ -252,6 +252,23 @@ ALPACA_PAPER_TRADING=true  # Use paper trading for safety
 
 **Note**: API keys are optional for training/testing (uses Yahoo Finance data). Required only for live trading.
 
+### PDT Protection
+
+The system includes automatic **Pattern Day Trading (PDT) protection** for accounts under $25,000:
+
+- **One-direction-per-day rule**: Each stock can only be bought OR sold on any given day
+- **First trade wins**: The first buy or sell for a stock each day determines the allowed direction
+- **Daily reset**: Tracking resets each trading day
+- **Portfolio threshold**: Only applies when total portfolio value < $25,000
+- **Automatic compliance**: Prevents PDT violations without manual intervention
+
+**Configuration:**
+
+```python
+PDT_PROTECTION_ENABLED = True  # Enable PDT protection
+ALLOW_SHORT_SELLING = False    # Disable short selling
+```
+
 ### Optimized Hyperparameters
 
 The system includes pre-optimized hyperparameters in `hyperparameters.json` (auto-loaded):
@@ -372,6 +389,7 @@ We welcome contributions! Please see our [Contributing Guidelines](docs/CONTRIBU
 - Built-in position limits (5 shares per trade by default)
 - Maximum shares per trade restrictions
 - Short selling disabled by default (`ALLOW_SHORT_SELLING = False`)
+- **PDT Protection**: One-direction-per-day rule for accounts under $25,000 (`PDT_PROTECTION_ENABLED = True`)
 - Comprehensive error handling and validation
 - Paper trading mode for safe testing
 
