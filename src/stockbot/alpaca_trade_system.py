@@ -260,14 +260,25 @@ class AlpacaTradingSystem:
         # Check if we've already traded this symbol today
         if symbol in self.daily_trade_direction:
             if self.daily_trade_direction[symbol] != trade_direction:
-                logger.info(f"PDT Protection: Skipping {symbol} {trade_direction} - already traded {self.daily_trade_direction[symbol]} today (Portfolio: ${portfolio_value:.2f})")
+                logger.info(f"[{symbol}] PDT Protection: Skipping {trade_direction} - already traded {self.daily_trade_direction[symbol]} today (Portfolio: ${portfolio_value:.2f})")
                 return True
         else:
-            # First trade of the day for this symbol - record the direction
-            self.daily_trade_direction[symbol] = trade_direction
-            logger.info(f"PDT Protection: First trade of day for {symbol} - direction set to {trade_direction} (Portfolio: ${portfolio_value:.2f})")
+            # First trade of the day for this symbol - log that we're attempting it
+            logger.info(f"[{symbol}] PDT Protection: First trade of day - attempting {trade_direction} (Portfolio: ${portfolio_value:.2f})")
             
         return False
+
+    def _record_successful_trade(self, symbol, trade_direction):
+        """
+        Record a successful trade for PDT protection tracking.
+        
+        Args:
+            symbol: Stock symbol
+            trade_direction: 'BUY' or 'SELL'
+        """
+        if PDT_PROTECTION_ENABLED:
+            self.daily_trade_direction[symbol] = trade_direction
+            logger.info(f"[{symbol}] PDT Protection: Successfully recorded {trade_direction} trade for today")
 
     def _get_price_data_yfinance(self, symbols, end_date, start_date):
         """
@@ -398,12 +409,14 @@ class AlpacaTradingSystem:
                                 order_data=market_order_data
                             )
                             logger.info(
-                                f"BUY ORDER: {shares_to_buy} shares of {symbol}"
+                                f"[{symbol}] BUY ORDER: {shares_to_buy} shares"
                             )
                             trades_executed += 1
+                            # Record successful trade for PDT protection
+                            self._record_successful_trade(symbol, "BUY")
 
                         except Exception as e:
-                            logger.error(f"Buy order failed for {symbol}: {e}")
+                            logger.error(f"[{symbol}] Buy order failed: {e}")
             elif signal < 0:  # Sell signal
                 # Check if we can sell (either have shares or short selling is allowed)
                 if current_shares > 0 or ALLOW_SHORT_SELLING:
@@ -431,12 +444,14 @@ class AlpacaTradingSystem:
                                 order_data=market_order_data
                             )
                             logger.info(
-                                f"SELL ORDER: {shares_to_sell} shares of {symbol}"
+                                f"[{symbol}] SELL ORDER: {shares_to_sell} shares"
                             )
                             trades_executed += 1
+                            # Record successful trade for PDT protection
+                            self._record_successful_trade(symbol, "SELL")
 
                         except Exception as e:
-                            logger.error(f"Sell order failed for {symbol}: {e}")
+                            logger.error(f"[{symbol}] Sell order failed: {e}")
         
         # Return the original action values for logging purposes
         logger.info(f"Trading Summary: {trades_executed} trades executed out of {len(self.symbols)} symbols analyzed")
